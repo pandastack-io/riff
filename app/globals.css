@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root{
+  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --font-mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --bg:#0a0b0d; --panel:#111317; --panel2:#15181d; --line:#22262e; --line2:#1a1e24;
+  --ink:#e8eaed; --muted:#9aa1ab; --faint:#646b76;
+  --accent:#2dd4bf; --accent-dim:#0f766e;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font-sans);
+  -webkit-font-smoothing:antialiased;overflow:hidden}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+::selection{background:rgba(45,212,191,.25)}
+/* thin scrollbars */
+*::-webkit-scrollbar{width:9px;height:9px}
+*::-webkit-scrollbar-thumb{background:#2a2f38;border-radius:6px;border:2px solid var(--bg)}
+*::-webkit-scrollbar-thumb:hover{background:#3a414c}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes shimmer{100%{transform:translateX(100%)}}
+.animate-fadeup{animation:fadeUp .28s cubic-bezier(.2,.7,.2,1) both}
+.spin{animation:spin .8s linear infinite}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.focus-ring:focus-visible{outline:2px solid var(--accent);outline-offset:2px}

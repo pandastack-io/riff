@@ -1,0 +1,54 @@
+name: 🐛 Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve Riff! Please redact any API keys or secrets from logs.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to '…'
+        2. Click '…'
+        3. See error
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Build / codegen
+        - Fork-to-explore (branches)
+        - Managed Postgres
+        - Scale-to-zero (hibernate/wake)
+        - UI / routing
+        - Self-hosting / setup
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: framework
+    attributes:
+      label: App framework (if relevant)
+      placeholder: React / Next.js / static
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Node version, model provider (OpenAI/Anthropic), self-hosted vs hosted PandaStack.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Dev server output, browser console, or screenshots. Redact secrets.
+      render: shell

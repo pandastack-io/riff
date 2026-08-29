@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & discussion
+    url: https://github.com/pandastack-io/riff/discussions
+    about: Ask questions, share what you built, or discuss ideas.
+  - name: 🔒 Report a security issue
+    url: https://github.com/pandastack-io/riff/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue.
+  - name: 📦 PandaStack (the compute layer)
+    url: https://pandastack.ai
+    about: Docs and help for the microVM platform Riff runs on.
