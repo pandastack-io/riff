@@ -1,8 +1,9 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { AgentStep, Project } from "@/lib/types";
+import type { AgentStep, Project, Brief, BriefAmbiguity, BriefAssumption, AcceptanceVerdict } from "@/lib/types";
 import { StepRow } from "@/components/ui";
+import { BriefCard } from "@/components/BriefCard";
 import { TopBar, Composer, PreviewFrame, Versions, ThemePanel, BranchPanel, CompareGrid } from "@/components/riff-ui";
 
 // The project workspace at /project/[id]. Loads the project, wakes its sandbox on
@@ -22,8 +23,13 @@ export default function Workspace({ projectId }: { projectId: string }) {
   const [ghBusy, setGhBusy] = useState(false);
   const [toast, setToast] = useState<{ text: string; href?: string; tone: "ok" | "err" } | null>(null);
   const [iframeKey, setIframeKey] = useState(0);
+  // The one question the Brief decided was worth blocking on, if any.
+  const [needsInput, setNeedsInput] = useState<BriefAmbiguity | null>(null);
   const stepsRef = useRef<HTMLDivElement>(null);
   const busyRef = useRef(false);
+  // The prompt the current brief was built from — replayed verbatim when the user
+  // answers the question, so the build continues from the same ask.
+  const promptRef = useRef("");
   busyRef.current = busy || branchBusy;
 
   useEffect(() => { stepsRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [steps]);
@@ -44,16 +50,30 @@ export default function Workspace({ projectId }: { projectId: string }) {
         if (!ev || !data) continue;
         const payload = JSON.parse(data);
         if (ev === "step") setSteps((s) => [...s, payload as AgentStep]);
+        // The Brief lands before the first build step, and again with verdicts
+        // once the running app has been checked against it.
+        else if (ev === "brief") setProject((p) => p ? { ...p, brief: payload as Brief } : p);
+        else if (ev === "verify") setProject((p) => p?.brief ? { ...p, brief: { ...p.brief, verdicts: payload.verdicts as AcceptanceVerdict[] } } : p);
+        else if (ev === "needsInput") setNeedsInput(payload.ambiguity as BriefAmbiguity);
         else if (ev === "done") { setProject(payload as Project); setIframeKey((k) => k + 1); }
         else if (ev === "fatal") setProject((p) => p ? { ...p, status: "error", error: payload.error } : p);
       }
     }
   }, []);
 
-  const runTurn = useCallback(async (prompt: string, imageDataUrl?: string) => {
+  const runTurn = useCallback(async (
+    prompt: string,
+    imageDataUrl?: string,
+    extra?: { decisions?: { ambiguityId: string; readingLabel: string; directive?: string }[]; resume?: boolean },
+  ) => {
     setBusy(true);
+    if (!extra?.resume) promptRef.current = prompt;
+    setNeedsInput(null);
     try {
-      const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId, prompt, imageDataUrl }) });
+      const res = await fetch("/api/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId, prompt, imageDataUrl, ...extra }),
+      });
       await consume(res);
     } finally { setBusy(false); }
   }, [projectId, consume]);
@@ -103,6 +123,23 @@ export default function Workspace({ projectId }: { projectId: string }) {
     setInput("");
     setProject({ ...project, messages: [...project.messages, { id: "u" + Date.now(), role: "user", text: trimmed, ts: Date.now() }] });
     await runTurn(trimmed);
+  }, [busy, project, runTurn]);
+
+  // The user answered the one question — replay the same prompt with the choice.
+  const answerQuestion = useCallback(async (a: BriefAmbiguity, readingLabel: string, directive: string) => {
+    if (busy) return;
+    setNeedsInput(null);
+    const base = promptRef.current || [...(project?.messages || [])].reverse().find((m) => m.role === "user")?.text || "";
+    setProject((p) => p ? { ...p, messages: [...p.messages, { id: "u" + Date.now(), role: "user", text: readingLabel, ts: Date.now() }] } : p);
+    await runTurn(base, undefined, { decisions: [{ ambiguityId: a.id, readingLabel, directive }], resume: true });
+  }, [busy, project, runTurn]);
+
+  // Flipping an assumption chip is just a very well-specified follow-up build.
+  const flipAssumption = useCallback(async (a: BriefAssumption) => {
+    if (busy || !project) return;
+    const prompt = `Change one thing: instead of ${a.text}, ${a.alternative}. Keep everything else about the app exactly as it is.`;
+    setProject({ ...project, messages: [...project.messages, { id: "u" + Date.now(), role: "user", text: a.alternative, ts: Date.now() }] });
+    await runTurn(prompt);
   }, [busy, project, runTurn]);
 
   const restore = useCallback(async (checkpointId: string) => {
@@ -166,14 +203,30 @@ export default function Workspace({ projectId }: { projectId: string }) {
     }
   }, []);
 
-  const startRound = useCallback(async (basePrompt: string, directives: string[]) => {
+  const startRound = useCallback(async (
+    basePrompt: string, directives: string[],
+    resolve?: { ambiguityId: string; labels: string[]; trunkLabel: string },
+  ) => {
     if (branchBusy || !project) return;
     setShowBranch(false); setBranchBusy(true);
     try {
-      const res = await fetch(`/api/projects/${project.id}/branch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ basePrompt, directives }) });
+      const res = await fetch(`/api/projects/${project.id}/branch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ basePrompt, directives, resolve }) });
       await consumeBranch(res);
     } finally { setBranchBusy(false); }
   }, [branchBusy, project, consumeBranch]);
+
+  // The wow: resolve an open reading by forking the RUNNING app into every
+  // interpretation and putting them side by side, instead of asking about it.
+  const exploreReadings = useCallback(async (a: BriefAmbiguity) => {
+    if (branchBusy || !project) return;
+    const readings = a.readings.slice(0, 4);
+    if (readings.length < 2) return;
+    await startRound(
+      promptRef.current || project.brief?.oneLiner || project.name,
+      readings.map((r) => r.directive),
+      { ambiguityId: a.id, labels: readings.map((r) => r.label), trunkLabel: readings[0].label },
+    );
+  }, [branchBusy, project, startRound]);
 
   const keepWinner = useCallback(async (branchId: string) => {
     if (!project) return;
@@ -187,13 +240,13 @@ export default function Workspace({ projectId }: { projectId: string }) {
     } finally { setBranchBusy(false); }
   }, [project]);
 
-  const discardAll = useCallback(async () => {
+  const discardAll = useCallback(async (keepTrunk = false) => {
     if (!project) return;
     setBranchBusy(true);
     try {
-      const res = await fetch(`/api/projects/${project.id}/branch/discard`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+      const res = await fetch(`/api/projects/${project.id}/branch/discard`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keepTrunk }) });
       setProject(await res.json()); setIframeKey((k) => k + 1);
-      setToast({ text: "Discarded the branches — back to your main line", tone: "ok" });
+      setToast({ text: keepTrunk ? "Kept the original — that's your main line" : "Discarded the branches — back to your main line", tone: "ok" });
     } finally { setBranchBusy(false); }
   }, [project]);
 
@@ -204,7 +257,7 @@ export default function Workspace({ projectId }: { projectId: string }) {
   const canBranch = project.status === "live" && !!project.sandboxId && !project.activeRoundId && !busy && !branchBusy;
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="app-shell flex h-screen flex-col">
       <TopBar project={project} onAddDatabase={addDatabase} dbBusy={dbBusy}
         onOpenTheme={() => { setShowTheme((v) => !v); setShowBranch(false); }} themeOpen={showTheme}
         onOpenBranch={() => { setShowBranch((v) => !v); setShowTheme(false); }} branchOpen={showBranch} canBranch={canBranch}
@@ -222,6 +275,13 @@ export default function Workspace({ projectId }: { projectId: string }) {
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(340px,420px)_1fr]">
         <section className="flex min-h-0 flex-col border-r border-[var(--line)] bg-[var(--panel)]">
           <div ref={stepsRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+            {project.brief && (
+              <BriefCard
+                brief={project.brief} needsInput={needsInput} busy={busy}
+                canFork={canBranch}
+                onAnswer={answerQuestion} onFlip={flipAssumption} onExplore={exploreReadings}
+              />
+            )}
             {project.messages.map((m) => (
               m.role === "user"
                 ? <div key={m.id} className="mb-3 ml-auto max-w-[92%] rounded-2xl rounded-br-md bg-[var(--accent-dim)]/25 px-3.5 py-2 text-[13.5px] text-teal-50">{m.text}</div>
@@ -238,7 +298,7 @@ export default function Workspace({ projectId }: { projectId: string }) {
         </section>
         <section className="flex min-h-0 flex-col bg-[var(--bg)]">
           {project.activeRoundId
-            ? <CompareGrid project={project} busy={branchBusy} onKeep={keepWinner} onDiscard={discardAll} />
+            ? <CompareGrid project={project} busy={branchBusy} onKeep={keepWinner} onDiscard={() => discardAll(false)} onKeepTrunk={() => discardAll(true)} />
             : <PreviewFrame project={project} busy={busy} iframeKey={iframeKey} onRefresh={() => setIframeKey((k) => k + 1)} />}
         </section>
       </div>

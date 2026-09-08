@@ -46,6 +46,8 @@ function userBlocks(req: CodegenRequest): Anthropic.TextBlockParam[] {
       cache_control: { type: "ephemeral" },
     });
   }
+  // The brief is stable across a build's fix-loop retries, so it rides the cache.
+  if (req.briefBlock) blocks.push({ type: "text", text: req.briefBlock, cache_control: { type: "ephemeral" } });
   if (req.dbAttached && req.framework.dbNote) blocks.push({ type: "text", text: req.framework.dbNote });
   if (req.imageDataUrl) blocks.push({ type: "text", text: "A reference image is attached. Reproduce its layout, structure, spacing, colors, and typography as faithfully as possible in code, then apply the user's request on top." });
   if (req.redesign) blocks.push({ type: "text", text: "THIS IS A REDESIGN / VARIANT TASK. You MUST return a visually DISTINCT result from the current files — commit fully to the requested direction across layout, color, typography, spacing, shapes, and motion. Keep the same core content and purpose, but do NOT return the existing files unchanged." });

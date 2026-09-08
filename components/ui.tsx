@@ -28,9 +28,11 @@ export function Spinner({ className = "" }: { className?: string }) {
 
 const ICON: Record<AgentStep["kind"], string> = {
   plan: "◇", write: "✎", install: "⤓", start: "▶", check: "◈", fix: "⟳", done: "✓", error: "✕", log: "·", db: "⛁",
+  brief: "◎", verify: "☑",
 };
 export function StepRow({ step, last }: { step: AgentStep; last: boolean }) {
-  const tone = step.kind === "done" ? "text-teal-300" : step.kind === "error" ? "text-rose-300" : step.kind === "fix" ? "text-amber-300" : "text-neutral-300";
+  const tone = step.kind === "done" ? "text-teal-300" : step.kind === "error" ? "text-rose-300" : step.kind === "fix" ? "text-amber-300"
+    : step.kind === "brief" || step.kind === "verify" ? "text-[var(--accent)]" : "text-neutral-300";
   return (
     <div className="animate-fadeup flex gap-3 py-1.5">
       <div className="mt-0.5 flex flex-col items-center">

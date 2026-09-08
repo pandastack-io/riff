@@ -10,6 +10,10 @@ Firecracker microVM, stays live forever for ~$0, and you can fork the running ap
 
 </div>
 
+<p align="center">
+  <img src="docs/riff-home.png" alt="Riff landing page: a prompt box beside a 3D fork tree, where one running app branches into three live variations" width="880">
+</p>
+
 ---
 
 Describe an app. Riff builds it and runs it live on a real microVM in about a
@@ -39,6 +43,8 @@ Lovable, v0, and bolt are closed SaaS, and every one of them hits the same walls
 - **Theme panel** — restyle the whole app (accent, style, light/dark) in one click.
 - **Checkpoints / time-travel** — every build is a restorable version.
 - **⑂ Fork-to-explore** — one prompt → N live branches (app + cloned DB) side by side → keep the winner. **The moat.**
+- **⑉ Understands the ask** — before it builds, Riff writes a **Brief**: what it understood, what it is assuming, and the checks the finished app must pass. When a prompt genuinely reads two ways, it doesn't interrogate you — it builds the likely one and offers to **fork the running app into the other reading** so you can pick by looking.
+- **Acceptance-checked builds** — after the app is live, Riff screenshots it and judges it against the Brief. A blank page, a crashed component, or a *"chart coming soon"* placeholder is a **failure**, not a success, and goes straight back into the self-fix loop.
 - **Model-agnostic** — OpenAI or Anthropic; a deterministic template generator runs with no key at all.
 
 ## Quickstart
@@ -66,7 +72,9 @@ Then open **http://localhost:4321**, describe an app, and watch it come up live.
          │  REST + SSE
          ▼
  Riff orchestrator (Next.js route handlers)
+   ├─ intent layer: prompt → Brief (understanding, assumptions, acceptance)
    ├─ agent loop: generate → write → run → observe logs → self-fix → live
+   ├─ verify: screenshot the LIVE app → judge vs the Brief → fix the misses
    ├─ codegen providers (OpenAI / Anthropic / template)
    └─ PandaStack SDK client  ── never runs generated code itself
          │
@@ -93,10 +101,16 @@ hardware. Apache-2.0/MIT; no lock-in.
 
 ## Status
 
-P0–P3 of the [roadmap](riff-plan.md) are built and live-verified: prompt→app,
-multi-framework, checkpoints, managed Postgres, image-to-code, in-app image gen,
-theme panel, and the fork-to-explore moat. Next up (P4): one-command self-host,
-a public gallery of live apps, and two-way GitHub sync.
+Built and live-verified: prompt→app, multi-framework, checkpoints, managed
+Postgres, image-to-code, in-app image generation, the theme panel, the
+fork-to-explore moat, and the **intent layer** — the Brief, fork-to-resolve, and
+acceptance checking against the running app.
+
+The plan behind the intent layer, including the phases not yet built (context-aware
+follow-ups, learning your taste, building over a CSV you drop in), is written up in
+[docs/understanding-plan.md](docs/understanding-plan.md).
+
+Next: one-command self-host, a public gallery of live apps, and two-way GitHub sync.
 
 ## License
 

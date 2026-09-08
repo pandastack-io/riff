@@ -3,7 +3,9 @@ import { store } from "./store";
 import { frameworkFor, APP_DIR, type FrameworkSpec } from "./frameworks";
 import { pickProvider } from "./codegen";
 import { imageGenEnabled, findGenRefs, promptFromSlug, generateImage } from "./imagegen";
-import type { Project, AgentStep, FileEntry, Checkpoint, Branch, BranchRound, BranchStatus } from "./types";
+import { generateBrief, briefToPrompt, blockingQuestion } from "./intent";
+import { verifyEnabled, verifyApp, verdictsToFeedback, type VerifyResult } from "./verify";
+import type { Project, AgentStep, FileEntry, Checkpoint, Branch, BranchRound, BranchStatus, Brief } from "./types";
 
 const MAX_GEN_IMAGES = 4;
 
@@ -14,40 +16,93 @@ const step = (kind: AgentStep["kind"], label: string, detail?: string): AgentSte
 export type StepSink = (s: AgentStep) => void;
 
 const MAX_FIX = 2;
+// One acceptance-driven retry per turn. A judge that is wrong twice in a row must
+// not be able to spin the build; the user sees the verdicts either way.
+const MAX_SEMANTIC_FIX = 1;
 
-export interface TurnOptions { imageDataUrl?: string }
+// A decision the user made about one of the Brief's ambiguities. The directive is
+// carried inline so it survives the Brief being regenerated on later turns.
+export interface BriefDecision { ambiguityId: string; readingLabel: string; directive?: string }
+
+export interface TurnOptions {
+  imageDataUrl?: string;
+  decisions?: BriefDecision[];
+  // Coarse side-channel for events that are not build steps (the Brief card, the
+  // acceptance verdicts, the one blocking question).
+  onEvent?: (event: string, data: unknown) => void;
+}
 
 // Run one build turn: generate, sync, (install), (re)start, verify, self-fix, checkpoint.
 export async function runAgentTurn(project: Project, prompt: string, emit: StepSink, opts: TurnOptions = {}): Promise<Project> {
   const provider = pickProvider();
   const fw = frameworkFor(project.framework);
   const push = async (s: AgentStep) => { emit(s); project.steps.push(s); await save(project); };
+  const fire = opts.onEvent || (() => {});
 
   try {
-    // 1. Ensure a live sandbox (re-boots if the old one was reaped).
-    const { sid, fresh } = await ensureSandbox(project, fw, push);
-
-    // 2. Codegen.
     const dbAttached = !!(project.database && project.database.status === "running");
+    const hadTrunk = !!project.sandboxId;
+    const resuming = !!opts.decisions?.length;
+
+    // 0. UNDERSTAND FIRST. The Brief says what Riff thinks the user asked for,
+    //    before a line of code exists. It runs on a fast model CONCURRENTLY with
+    //    the microVM boot, so on the common path it costs no wall-clock at all.
+    //    On a resume (the user just answered the one question) the stored Brief is
+    //    reused — regenerating it would mint new ambiguity ids and re-ask forever.
+    const briefP: Promise<Brief> = resuming && project.brief
+      ? Promise.resolve(project.brief)
+      : generateBrief({ prompt, framework: fw, existingBrief: project.brief, dbAttached, imageDataUrl: opts.imageDataUrl });
+    const sandboxP = ensureSandbox(project, fw, push);
+    sandboxP.catch(() => {}); // the real await below is what surfaces a boot failure
+
+    project.brief = await briefP;
+    applyDecisions(project.brief, opts.decisions);
+    await push(step("brief", `Understood — ${project.brief.title}`, project.brief.oneLiner));
+    fire("brief", project.brief);
+    await save(project);
+
+    // 1. The ONE question worth blocking on: a high-impact fork in the road, on a
+    //    project with nothing live to show yet. Everything else is assumed and
+    //    stated, or offered as a live fork once the app is up.
+    const q = resuming ? null : blockingQuestion(project.brief, hadTrunk);
+    if (q) {
+      await sandboxP.catch(() => null); // let the VM finish booting so answering is instant
+      project.status = hadTrunk ? "live" : "new";
+      await push(step("brief", "One thing before I build", q.question));
+      fire("needsInput", { ambiguity: q });
+      await save(project);
+      return project;
+    }
+
+    // 2. Ensure a live sandbox (re-boots if the old one was reaped).
+    const { sid, fresh } = await sandboxP;
+
+    // 3. Codegen — against the Brief, not just the raw prompt.
+    const briefBlock = briefToPrompt(project.brief);
     project.status = "generating"; await push(step("plan", opts.imageDataUrl ? `Reading your design with ${provider.name}…` : `Generating with ${provider.name}…`));
-    let gen = await provider.generate({ prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), dbAttached, imageDataUrl: opts.imageDataUrl });
+    let gen = await provider.generate({ prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), dbAttached, imageDataUrl: opts.imageDataUrl, briefBlock });
     await push(step("write", "Wrote " + gen.files.map((f) => f.path).join(", "), gen.summary));
 
-    // 3. Sync files (scaffold once per fresh sandbox + app source every turn).
+    // 4. Sync files (scaffold once per fresh sandbox + app source every turn).
     const toWrite: FileEntry[] = fresh ? [...fw.scaffold(), ...gen.files] : gen.files;
     await writeFiles(sid, toWrite);
     project.files = mergeFiles(project.files, toWrite);
 
-    // 4. Install on a fresh sandbox (frameworks that need it).
+    // 5. Install on a fresh sandbox (frameworks that need it).
     if (fresh && fw.install) await installDeps(sid, fw, project, push);
-    // 4b. Ensure the Postgres client is present when a database is attached.
+    // 5b. Ensure the Postgres client is present when a database is attached.
     if (dbAttached && fw.id === "next") await ensurePg(sid, push);
-    // 4c. Materialize any AI images the generated code references.
+    // 5c. Materialize any AI images the generated code references.
     await materializeImages(sid, fw, project, push);
 
-    // 5. (Re)start the dev server + verify — with a bounded self-fix loop.
+    // 6. (Re)start the dev server, then TWO gates before we call it done:
+    //    (a) does it serve at all — the build-log fix loop, as before;
+    //    (b) does it match the Brief — the acceptance check, which is new. A
+    //        semantic miss is fed back as ordinary feedback, so both gates share
+    //        one regenerate-write-restart loop.
     project.status = "starting";
     let attempt = 0;
+    let semantic = 0;
     while (true) {
       await restartDevServer(sid, fw, dbAttached ? project.database!.connectionUrl : undefined);
       project.status = "checking"; await push(step("check", "Waiting for the app to serve…"));
@@ -55,6 +110,22 @@ export async function runAgentTurn(project: Project, prompt: string, emit: StepS
       if (res.ok) {
         project.previewUrl = pandastack.previewUrl(sid, fw.port);
         project.status = "live";
+        const vr = await verifyTurn(project, push, fire);
+        if (vr && !vr.ok && semantic < MAX_SEMANTIC_FIX) {
+          semantic++;
+          const misses = vr.verdicts.filter((v) => v.status === "fail").length;
+          await push(step("fix", `${misses} thing${misses === 1 ? "" : "s"} missing from the brief — fixing`, vr.evidenceNote));
+          project.status = "generating";
+          gen = await provider.generate({
+            prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw),
+            feedback: verdictsToFeedback(project.brief!.acceptance, vr.verdicts),
+            dbAttached, briefBlock,
+          });
+          await writeFiles(sid, gen.files);
+          project.files = mergeFiles(project.files, gen.files);
+          await materializeImages(sid, fw, project, push);
+          continue;
+        }
         captureCheckpoint(project, fw, prompt, gen.summary);
         await push(step("done", `Live in ${(res.ms / 1000).toFixed(1)}s`, project.previewUrl));
         break;
@@ -68,7 +139,7 @@ export async function runAgentTurn(project: Project, prompt: string, emit: StepS
       attempt++;
       await push(step("fix", `Build issue — self-fixing (attempt ${attempt}/${MAX_FIX})`, log.slice(-200)));
       project.status = "generating";
-      gen = await provider.generate({ prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), feedback: log, dbAttached, imageDataUrl: opts.imageDataUrl });
+      gen = await provider.generate({ prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), feedback: log, dbAttached, imageDataUrl: opts.imageDataUrl, briefBlock });
       await writeFiles(sid, gen.files);
       project.files = mergeFiles(project.files, gen.files);
     }
@@ -141,6 +212,7 @@ async function ensureTrunkLive(project: Project, fw: FrameworkSpec): Promise<str
   if (project.sandboxId && await pandastack.isAlive(project.sandboxId)) return project.sandboxId;
   const sb = await pandastack.createSandbox("base");
   project.sandboxId = sb.id;
+  await waitForGuest(sb.id);
   await writeFiles(sb.id, project.files); // project.files holds scaffold + source
   if (fw.install) await installDeps(sb.id, fw, project, noopPush);
   const dbUrl = project.database?.status === "running" ? project.database.connectionUrl : undefined;
@@ -170,7 +242,12 @@ export async function reclaimPendingDbs(projectId: string) {
 
 // Fan out N branches from one base prompt. The trunk is only READ (its disk is
 // reflinked), never mutated, so its own preview stays live as a zero-risk fallback.
-export async function runBranchRound(project: Project, basePrompt: string, directives: string[], emit: BranchSink): Promise<Project> {
+// `resolve` marks the round as answering one of the Brief's open questions: each
+// forked branch IS a reading of the prompt, the trunk is the reading already
+// built, and whichever tile is kept records the decision on the Brief.
+export interface RoundResolve { ambiguityId: string; labels: string[]; trunkLabel: string }
+
+export async function runBranchRound(project: Project, basePrompt: string, directives: string[], emit: BranchSink, resolve?: RoundResolve): Promise<Project> {
   const fw = frameworkFor(project.framework);
   const provider = pickProvider();
   const dirs = directives.map((d) => (d || "").trim()).filter(Boolean).slice(0, 4);
@@ -202,7 +279,9 @@ export async function runBranchRound(project: Project, basePrompt: string, direc
     const branches: Branch[] = dirs.map((directive, i) => ({
       id: `b${Date.now()}_${i}`, roundId, label: String.fromCharCode(65 + i), directive,
       parentSandboxId: trunkSid, sandboxId: null, status: "spawning" as BranchStatus,
-      previewUrl: null, files: [], createdAt: Date.now(),
+      previewUrl: null, files: [],
+      ambiguityId: resolve?.ambiguityId, readingLabel: resolve?.labels[i],
+      createdAt: Date.now(),
     }));
     const round: BranchRound = {
       id: roundId, basePrompt, fromSandboxId: trunkSid,
@@ -210,7 +289,9 @@ export async function runBranchRound(project: Project, basePrompt: string, direc
       // clone + replace it (dbAttached). Otherwise keep must never delete it.
       fromDatabaseId: dbAttached ? (project.database?.id ?? null) : null,
       baselineFiles: baseline, baseCheckpointId: project.checkpoints[project.checkpoints.length - 1]?.id,
-      branchIds: branches.map((b) => b.id), createdAt: Date.now(),
+      branchIds: branches.map((b) => b.id),
+      ambiguityId: resolve?.ambiguityId, trunkReadingLabel: resolve?.trunkLabel,
+      createdAt: Date.now(),
     };
     await store.mutate(project.id, (fp) => {
       fp.branches = [...(fp.branches || []), ...branches];
@@ -254,14 +335,7 @@ async function runOneBranch(
     const fork = await pandastack.forkSandbox(b.parentSandboxId);
     childId = fork.childId;
     if (!(await patch(b, { sandboxId: childId, snapshotId: fork.snapshotId }))) return abortCleanup();
-    // Warm the exec channel: the FIRST exec on a freshly cold-booted fork can
-    // return empty without running (the vsock bridge needs a moment). Probe until
-    // the guest actually answers, so the real restart exec below is reliable.
-    for (let i = 0; i < 6; i++) {
-      const r = await pandastack.exec(childId, "echo rdy", 20000).catch(() => null);
-      if (r && r.stdout.includes("rdy")) break;
-      await new Promise((res) => setTimeout(res, 500));
-    }
+    await waitForGuest(childId);
 
     // 2. Full-stack only: clone the DB so this branch writes to its own data.
     //    Fail CLOSED — never reuse the trunk DB (guards against cross-branch writes).
@@ -357,6 +431,8 @@ export async function keepBranch(project: Project, branchId: string): Promise<Pr
     fp.files = mergeFiles(mergeFiles(fw.scaffold(), round.baselineFiles), win.files);
     if (winDbId) fp.database = { id: winDbId, status: "running", connectionUrl: win.databaseUrl || undefined, createdAt: Date.now() };
     captureCheckpoint(fp, fw, round.basePrompt, win.summary || `Kept variation ${win.label}`);
+    // Picking a variation IS the answer to the question that spawned it.
+    recordDecision(fp, win.ambiguityId, win.readingLabel, win.directive);
     const fr = (fp.rounds || []).find((r) => r.id === round.id);
     if (fr) fr.keptBranchId = branchId;
     for (const fb of (fp.branches || []).filter((b) => b.roundId === round.id)) fb.status = fb.id === branchId ? "kept" : "discarded";
@@ -386,6 +462,27 @@ export async function keepBranch(project: Project, branchId: string): Promise<Pr
   return updated;
 }
 
+// Write a resolved fork onto the Brief so it is never asked, or offered, again.
+function recordDecision(p: Project, ambiguityId?: string, readingLabel?: string, directive?: string) {
+  if (!p.brief || !ambiguityId || !readingLabel) return;
+  if (p.brief.decisions.some((d) => d.ambiguityId === ambiguityId)) return;
+  p.brief.decisions.push({ ambiguityId, readingLabel, directive, source: "kept-branch" });
+  p.brief.updatedAt = Date.now();
+}
+
+// "The one I already had is right." The trunk was never mutated by the round, so
+// this is a discard plus a recorded decision — no rebuild, no promotion.
+export async function keepTrunk(project: Project, roundId?: string): Promise<Project> {
+  const rid = roundId || project.activeRoundId || undefined;
+  const round = (project.rounds || []).find((r) => r.id === rid);
+  const updated = await discardRound(project, rid);
+  if (!round?.ambiguityId || !round.trunkReadingLabel) return updated;
+  return (await store.mutate(project.id, (fp) => {
+    recordDecision(fp, round.ambiguityId, round.trunkReadingLabel);
+    fp.messages.push({ id: `m${Date.now()}`, role: "assistant", text: `Kept the original — ${round.trunkReadingLabel}. That's the main line.`, ts: Date.now() });
+  })) || updated;
+}
+
 // Throw away a round: tear down its branches, leave the (never-mutated) trunk.
 export async function discardRound(project: Project, roundId?: string): Promise<Project> {
   const rid = roundId || project.activeRoundId;
@@ -409,6 +506,46 @@ export async function discardRound(project: Project, roundId?: string): Promise<
   return updated;
 }
 
+// --- intent helpers ---
+
+// Record the reading the user picked. Matched against the STORED brief (whose ids
+// the client was given), and the directive is copied inline so the decision keeps
+// working after the Brief is regenerated on a later turn.
+function applyDecisions(brief: Brief, decisions?: BriefDecision[]) {
+  if (!decisions?.length) return;
+  for (const d of decisions) {
+    if (!d.ambiguityId || !d.readingLabel) continue;
+    if (brief.decisions.some((x) => x.ambiguityId === d.ambiguityId)) continue;
+    const am = brief.ambiguities.find((a) => a.id === d.ambiguityId);
+    const directive = d.directive || am?.readings.find((r) => r.label === d.readingLabel)?.directive;
+    brief.decisions.push({ ambiguityId: d.ambiguityId, readingLabel: d.readingLabel, directive, source: "user" });
+  }
+}
+
+// Look at the app that is actually running and check it against the Brief. Returns
+// null when there is nothing to check or no way to check it — the build then ends
+// exactly as it did before this existed.
+async function verifyTurn(project: Project, push: (s: AgentStep) => Promise<void>, fire: (e: string, d: unknown) => void): Promise<VerifyResult | null> {
+  const acceptance = project.brief?.acceptance || [];
+  if (!verifyEnabled() || !acceptance.length || !project.previewUrl) return null;
+  await push(step("verify", "Checking it against the brief…", `${acceptance.length} acceptance checks`));
+  const vr = await verifyApp(project.previewUrl, acceptance);
+  if (vr.skipped) { await push(step("verify", "Acceptance check skipped", vr.skipped)); return null; }
+
+  project.brief!.verdicts = vr.verdicts;
+  project.brief!.updatedAt = Date.now();
+  fire("verify", { verdicts: vr.verdicts });
+  const pass = vr.verdicts.filter((v) => v.status === "pass").length;
+  const fails = vr.verdicts.filter((v) => v.status === "fail");
+  await push(
+    fails.length
+      ? step("verify", `${fails.length} of ${vr.verdicts.length} checks failed`, vr.evidenceNote || fails.map((f) => f.reason).join(" · ").slice(0, 200))
+      : step("verify", `Matches the brief — ${pass}/${vr.verdicts.length} checks pass`),
+  );
+  await save(project);
+  return vr;
+}
+
 // --- lifecycle helpers ---
 
 async function ensureSandbox(project: Project, fw: FrameworkSpec, push: (s: AgentStep) => Promise<void>): Promise<{ sid: string; fresh: boolean }> {
@@ -419,8 +556,22 @@ async function ensureSandbox(project: Project, fw: FrameworkSpec, push: (s: Agen
   else { project.status = "booting"; await push(step("plan", "Booting a fresh microVM…")); }
   const sb = await pandastack.createSandbox("base");
   project.sandboxId = sb.id;
+  await waitForGuest(sb.id);
   await push(step("plan", "microVM ready", `${sb.id.slice(0, 8)} · boot ${sb.boot_ms ?? "?"}ms`));
   return { sid: sb.id, fresh: true };
+}
+
+// A sandbox answers the control API before its guest agent is reachable, so the
+// FIRST exec or file write can fail outright ("connect failed") or return empty
+// without running. Probe until the guest actually answers. Applies to both a
+// freshly created VM and a cold-booted fork — same vsock/ssh bridge, same race.
+async function waitForGuest(sid: string, tries = 12): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    const r = await pandastack.exec(sid, "echo rdy", 20000).catch(() => null);
+    if (r && r.stdout.includes("rdy")) return true;
+    await new Promise((res) => setTimeout(res, 500));
+  }
+  return false;
 }
 
 async function installDeps(sid: string, fw: FrameworkSpec, project: Project, push: (s: AgentStep) => Promise<void>) {
@@ -550,8 +701,27 @@ function mergeFiles(cur: FileEntry[], next: FileEntry[]): FileEntry[] {
   for (const f of next) m.set(f.path, f);
   return [...m.values()];
 }
+// Each file write opens its own channel to the guest, and sshd caps concurrent
+// sessions per connection (OpenSSH defaults to 10). An unbounded Promise.all over
+// a scaffold plus a handful of generated components blows straight through that
+// and the platform answers "ssh: rejected: connect failed" — so writes run a few
+// at a time. Still concurrent, just inside the guest's budget.
+const WRITE_CONCURRENCY = 4;
+
+async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<unknown>): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function writeFiles(sid: string, files: FileEntry[]) {
-  await Promise.all(files.map((f) => pandastack.writeFile(sid, `${APP_DIR}/${f.path}`, f.content)));
+  await mapLimit(files, WRITE_CONCURRENCY, (f) => pandastack.writeFile(sid, `${APP_DIR}/${f.path}`, f.content));
 }
 async function tailLog(sid: string): Promise<string> {
   try { const r = await pandastack.exec(sid, "tail -40 /var/log/riff-app.log 2>/dev/null", 20000); return r.stdout || ""; }

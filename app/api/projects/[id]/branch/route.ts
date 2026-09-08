@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { store } from "@/lib/store";
-import { runBranchRound, activeRounds } from "@/lib/agent";
+import { runBranchRound, activeRounds, type RoundResolve } from "@/lib/agent";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -9,13 +9,19 @@ export const maxDuration = 300;
 // transitions (round / branch / done / fatal) so each tile flips live independently.
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const { basePrompt, directives } = await req.json();
+  const { basePrompt, directives, resolve } = await req.json();
   const project = await store.get(id);
   if (!project) return new Response(JSON.stringify({ error: "project not found" }), { status: 404 });
   // One fork round per project at a time (also blocks if a stale round is still winding down).
   if (activeRounds.has(id) || project.activeRoundId) return new Response(JSON.stringify({ error: "a branch round is already in progress" }), { status: 409 });
   const dirs: string[] = Array.isArray(directives) ? directives.map(String) : [];
   if (dirs.filter((d) => d.trim()).length < 2) return new Response(JSON.stringify({ error: "need at least 2 branch directives" }), { status: 400 });
+  // Present when the round is exploring one of the Brief's open readings, so the
+  // tile the user keeps can be recorded as the answer.
+  const res: RoundResolve | undefined =
+    resolve && typeof resolve.ambiguityId === "string" && Array.isArray(resolve.labels)
+      ? { ambiguityId: resolve.ambiguityId, labels: resolve.labels.map(String), trunkLabel: String(resolve.trunkLabel || "the original") }
+      : undefined;
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -23,7 +29,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       const send = (event: string, data: unknown) =>
         controller.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       try {
-        await runBranchRound(project, String(basePrompt || "").trim(), dirs, send);
+        await runBranchRound(project, String(basePrompt || "").trim(), dirs, send, res);
       } catch (e) {
         send("fatal", { error: e instanceof Error ? e.message : String(e) });
       } finally {

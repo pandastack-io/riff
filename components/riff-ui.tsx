@@ -395,15 +395,25 @@ export function BranchPanel({ busy, lastPrompt, onExplore, onClose }: { busy: bo
   );
 }
 
-export function CompareGrid({ project, busy, onKeep, onDiscard }: { project: Project; busy: boolean; onKeep: (id: string) => void; onDiscard: () => void }) {
+export function CompareGrid({ project, busy, onKeep, onDiscard, onKeepTrunk }: { project: Project; busy: boolean; onKeep: (id: string) => void; onDiscard: () => void; onKeepTrunk?: () => void }) {
   const branches = (project.branches || []).filter((b) => b.roundId === project.activeRoundId);
   const liveCount = branches.filter((b) => b.status === "live").length;
+  // A round started from the Brief is answering a question, so the app that was
+  // already there is one of the answers — offer it as a choice, not just an escape.
+  const round = (project.rounds || []).find((r) => r.id === project.activeRoundId);
+  const resolving = !!round?.ambiguityId;
   return (
     <div className="flex min-h-0 flex-1 flex-col p-3">
       <div className="mb-2 flex items-center gap-3">
-        <span className="text-[13px] font-semibold text-[var(--ink)]">Comparing {branches.length} variations</span>
+        <span className="text-[13px] font-semibold text-[var(--ink)]">{resolving ? "Which did you mean?" : `Comparing ${branches.length} variations`}</span>
         <span className="text-[11.5px] text-[var(--faint)]">{liveCount}/{branches.length} live — pick a winner</span>
-        <button onClick={onDiscard} disabled={busy} className="ml-auto rounded-lg border border-[var(--line)] bg-[var(--panel2)] px-2.5 py-1 text-[12px] text-[var(--muted)] transition hover:border-rose-400/40 hover:text-rose-300 disabled:opacity-40">Discard all</button>
+        <div className="ml-auto flex items-center gap-2">
+          {resolving && onKeepTrunk && (
+            <button onClick={onKeepTrunk} disabled={busy} title="Go back to the app you already had"
+              className="rounded-lg border border-[var(--line)] bg-[var(--panel2)] px-2.5 py-1 text-[12px] text-[var(--muted)] transition hover:border-[var(--accent)]/40 hover:text-[var(--ink)] disabled:opacity-40">Keep the original</button>
+          )}
+          <button onClick={onDiscard} disabled={busy} className="rounded-lg border border-[var(--line)] bg-[var(--panel2)] px-2.5 py-1 text-[12px] text-[var(--muted)] transition hover:border-rose-400/40 hover:text-rose-300 disabled:opacity-40">Discard all</button>
+        </div>
       </div>
       <div className={`grid min-h-0 flex-1 gap-3 ${branches.length <= 1 ? "grid-cols-1" : "grid-cols-2"} ${branches.length > 2 ? "grid-rows-2" : "grid-rows-1"}`}>
         {branches.map((b) => <BranchCard key={b.id} b={b} busy={busy} onKeep={onKeep} />)}
@@ -418,7 +428,8 @@ function BranchCard({ b, busy, onKeep }: { b: Branch; busy: boolean; onKeep: (id
     <div className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--panel)]">
       <div className="flex items-center gap-2 border-b border-[var(--line)] px-2.5 py-1.5">
         <span className="mono grid h-5 w-5 shrink-0 place-items-center rounded-md bg-[var(--accent)] text-[11px] font-bold text-neutral-950">{b.label}</span>
-        <span className="truncate text-[11.5px] text-[var(--muted)]" title={b.directive}>{b.directive.replace(/^.*?—\s*/, "")}</span>
+        {/* For a Brief-driven round the caption is the INTERPRETATION, not the raw directive. */}
+        <span className="truncate text-[11.5px] text-[var(--muted)]" title={b.directive}>{b.readingLabel || b.directive.replace(/^.*?—\s*/, "")}</span>
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           <StatusPill status={mapToStatus(b.status)} />
           {live && <a href={b.previewUrl!} target="_blank" rel="noreferrer" title="Open" className="grid h-6 w-6 place-items-center rounded-md border border-[var(--line)] text-[var(--muted)] hover:text-[var(--ink)]">↗</a>}
