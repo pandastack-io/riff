@@ -59,11 +59,21 @@ export interface BriefAmbiguity {
   impact: "low" | "med" | "high";
 }
 
+// A single scripted step, for an acceptance item that can only be judged after
+// someone has actually used the app. Deliberately tiny: a click, some typing, a
+// pause. Anything richer belongs in a test suite, not a build check.
+export interface AcceptanceAction {
+  kind: "click" | "type" | "wait";
+  target: string; // visible label, placeholder or role name — never a CSS selector
+  value: string;  // text to type, or milliseconds to wait
+}
+
 // One testable claim about the finished app. This is the verify checklist.
 export interface AcceptanceItem {
   id: string;
   text: string;                              // "shows the remaining time as mm:ss"
   check: "visual" | "dom" | "interaction";   // how it would be verified
+  actions?: AcceptanceAction[];              // only for "interaction" — 1-3 steps
 }
 
 export type VerdictStatus = "pass" | "fail" | "unverifiable";
@@ -94,6 +104,22 @@ export interface Brief {
   verdicts?: AcceptanceVerdict[];      // last verification pass
   confidence: number;                  // 0..1 overall
   createdAt: number;
+  updatedAt: number;
+}
+
+// --- taste: what Riff has learned about how this user likes things ------------
+// Collected from decisions they already make — which fork they keep, which
+// assumption they flip, what they ask for again and again — so it costs them
+// nothing to teach and no other builder has the same signal to learn from.
+export interface TasteSignal {
+  kind: "kept-branch" | "rejected-branch" | "flip" | "correction";
+  text: string;
+  ts: number;
+}
+export interface Prefs {
+  note: string;            // the distilled sentence or two, injected into prompts
+  signals: TasteSignal[];  // raw evidence, capped
+  distilledAt: number;     // signal count at the last distillation
   updatedAt: number;
 }
 
@@ -154,6 +180,11 @@ export interface Project {
   id: string;                 // riff project id
   name: string;
   sandboxId: string | null;   // pandastack sandbox id
+  // The sandbox the fixed harness has actually been written to. "Was this VM just
+  // created" is NOT the same question as "does this VM have a package.json on it":
+  // the Brief's blocking question boots a VM and then returns, so the turn that
+  // resumes afterwards finds a sandbox that is neither fresh nor scaffolded.
+  scaffoldedSandboxId?: string | null;
   status: ProjectStatus;
   previewUrl: string | null;
   port: number;
