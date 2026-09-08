@@ -93,14 +93,28 @@ export function Logo() {
 export function Dot() { return <span className="h-3 w-3 rounded-full border border-[var(--line)]" />; }
 
 // A single "prompt" composer used on the home page (with image attach + framework picker).
+export interface DataFile { name: string; text: string; rows: number }
+
 export function PromptComposer({ framework, setFramework, onStart, autoFocus = true }: {
-  framework: FwChoice; setFramework: (f: FwChoice) => void; onStart: (s: string, f: FwChoice, image?: string) => void; autoFocus?: boolean;
+  framework: FwChoice; setFramework: (f: FwChoice) => void;
+  onStart: (s: string, f: FwChoice, image?: string, data?: DataFile) => void;
+  autoFocus?: boolean;
 }) {
   const [input, setInput] = useState("");
   const [image, setImage] = useState<string | null>(null);
+  const [data, setData] = useState<DataFile | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const dataRef = useRef<HTMLInputElement>(null);
   const pick = async (f: File | undefined) => { if (f) setImage(await fileToDataUrl(f)); };
-  const go = () => onStart(input, framework, image || undefined);
+  // Read it here so the user sees the row count before they commit; the server
+  // re-parses it properly and never trusts anything derived on this side.
+  const pickData = async (f: File | undefined) => {
+    if (!f) return;
+    const text = (await f.text()).slice(0, 400_000);
+    const rows = Math.max(0, text.trim().split(/\r?\n/).length - 1);
+    setData({ name: f.name, text, rows });
+  };
+  const go = () => onStart(input, framework, image || undefined, data || undefined);
   return (
     <form onSubmit={(e) => { e.preventDefault(); go(); }}>
       <div className="rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-2 shadow-2xl shadow-black/40 transition focus-within:border-[var(--accent)]/40">
@@ -114,6 +128,16 @@ export function PromptComposer({ framework, setFramework, onStart, autoFocus = t
             <span className="text-[12px] text-[var(--muted)]">Cloning this design</span>
           </div>
         )}
+        {data && (
+          <div className="flex items-center gap-2 px-3 pt-2">
+            <span className="flex items-center gap-2 rounded-lg border border-sky-400/30 bg-sky-400/10 px-2.5 py-1 text-[12px] text-sky-200">
+              ⛁ {data.name}
+              <span className="mono text-[10.5px] text-sky-300/70">{data.rows} rows</span>
+              <button type="button" onClick={() => setData(null)} className="opacity-60 hover:opacity-100">✕</button>
+            </span>
+            <span className="text-[11.5px] text-[var(--faint)]">building over your data</span>
+          </div>
+        )}
         <textarea
           autoFocus={autoFocus} value={input} onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); go(); } }}
@@ -125,9 +149,12 @@ export function PromptComposer({ framework, setFramework, onStart, autoFocus = t
             <input ref={fileRef} type="file" accept="image/*" hidden onChange={(e) => pick(e.target.files?.[0])} />
             <button type="button" onClick={() => fileRef.current?.click()} title="Attach a screenshot to clone"
               className="grid h-8 w-8 place-items-center rounded-lg border border-[var(--line)] bg-[var(--panel2)] text-[var(--muted)] transition hover:border-[var(--accent)]/30 hover:text-[var(--ink)]">🖼</button>
+            <input ref={dataRef} type="file" accept=".csv,.tsv,.json,text/csv,application/json" hidden onChange={(e) => pickData(e.target.files?.[0])} />
+            <button type="button" onClick={() => dataRef.current?.click()} title="Attach a CSV or JSON to build over your own data"
+              className="grid h-8 w-8 place-items-center rounded-lg border border-[var(--line)] bg-[var(--panel2)] text-[var(--muted)] transition hover:border-sky-400/40 hover:text-sky-200">⛁</button>
             <FrameworkPicker value={framework} onChange={setFramework} />
           </div>
-          <button type="submit" className="shrink-0 rounded-xl bg-[var(--accent)] px-4 py-2 text-sm font-medium text-neutral-950 transition hover:bg-teal-300 active:scale-95">{image ? "Clone it" : "Build it"}</button>
+          <button type="submit" className="shrink-0 rounded-xl bg-[var(--accent)] px-4 py-2 text-sm font-medium text-neutral-950 transition hover:bg-teal-300 active:scale-95">{image ? "Clone it" : data ? "Build over it" : "Build it"}</button>
         </div>
       </div>
     </form>
@@ -402,21 +429,49 @@ export function CompareGrid({ project, busy, onKeep, onDiscard, onKeepTrunk }: {
   // already there is one of the answers — offer it as a choice, not just an escape.
   const round = (project.rounds || []).find((r) => r.id === project.activeRoundId);
   const resolving = !!round?.ambiguityId;
+  const showTrunk = resolving && !!onKeepTrunk && !!project.previewUrl;
+  const tiles = branches.length + (showTrunk ? 1 : 0);
   return (
     <div className="flex min-h-0 flex-1 flex-col p-3">
       <div className="mb-2 flex items-center gap-3">
         <span className="text-[13px] font-semibold text-[var(--ink)]">{resolving ? "Which did you mean?" : `Comparing ${branches.length} variations`}</span>
         <span className="text-[11.5px] text-[var(--faint)]">{liveCount}/{branches.length} live — pick a winner</span>
         <div className="ml-auto flex items-center gap-2">
-          {resolving && onKeepTrunk && (
-            <button onClick={onKeepTrunk} disabled={busy} title="Go back to the app you already had"
-              className="rounded-lg border border-[var(--line)] bg-[var(--panel2)] px-2.5 py-1 text-[12px] text-[var(--muted)] transition hover:border-[var(--accent)]/40 hover:text-[var(--ink)] disabled:opacity-40">Keep the original</button>
-          )}
           <button onClick={onDiscard} disabled={busy} className="rounded-lg border border-[var(--line)] bg-[var(--panel2)] px-2.5 py-1 text-[12px] text-[var(--muted)] transition hover:border-rose-400/40 hover:text-rose-300 disabled:opacity-40">Discard all</button>
         </div>
       </div>
-      <div className={`grid min-h-0 flex-1 gap-3 ${branches.length <= 1 ? "grid-cols-1" : "grid-cols-2"} ${branches.length > 2 ? "grid-rows-2" : "grid-rows-1"}`}>
+      <div className={`grid min-h-0 flex-1 gap-3 ${tiles <= 1 ? "grid-cols-1" : "grid-cols-2"} ${tiles > 2 ? "grid-rows-2" : "grid-rows-1"}`}>
+        {/* Resolving a question? Then the app you already had is one of the answers,
+            so it gets a tile of its own rather than only a button in the header. */}
+        {showTrunk && (
+          <TrunkCard label={round?.trunkReadingLabel || "what you have now"} previewUrl={project.previewUrl}
+            busy={busy} onKeep={onKeepTrunk!} />
+        )}
         {branches.map((b) => <BranchCard key={b.id} b={b} busy={busy} onKeep={onKeep} />)}
+      </div>
+    </div>
+  );
+}
+
+// The pre-fork app, shown alongside the variations so "none of these, keep what I
+// had" is a choice you can see rather than a button you have to find.
+function TrunkCard({ label, previewUrl, busy, onKeep }: { label: string; previewUrl: string | null; busy: boolean; onKeep: () => void }) {
+  return (
+    <div className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--panel)]">
+      <div className="flex items-center gap-2 border-b border-[var(--line)] px-2.5 py-1.5">
+        <span className="mono grid h-5 w-5 shrink-0 place-items-center rounded-md border border-[var(--line)] bg-[var(--panel2)] text-[11px] font-bold text-[var(--muted)]">◦</span>
+        <span className="truncate text-[11.5px] text-[var(--muted)]" title={label}>{label}</span>
+        <span className="mono shrink-0 rounded-full bg-white/5 px-1.5 py-0.5 text-[9.5px] text-[var(--faint)]">what you have now</span>
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {previewUrl && <a href={previewUrl} target="_blank" rel="noreferrer" title="Open" className="grid h-6 w-6 place-items-center rounded-md border border-[var(--line)] text-[var(--muted)] hover:text-[var(--ink)]">↗</a>}
+          <button onClick={onKeep} disabled={busy}
+            className="rounded-md border border-[var(--line)] bg-[var(--panel2)] px-2 py-1 text-[11.5px] font-medium text-[var(--muted)] transition hover:border-[var(--accent)]/40 hover:text-[var(--ink)] disabled:opacity-30 active:scale-95">Keep this</button>
+        </div>
+      </div>
+      <div className="relative min-h-0 flex-1 bg-white">
+        {previewUrl
+          ? <iframe src={previewUrl} className="h-full w-full border-0" title="the app before forking" sandbox="allow-scripts allow-forms allow-same-origin allow-popups" />
+          : <div className="grid h-full place-items-center bg-[var(--bg)] text-[12px] text-[var(--faint)]">no preview</div>}
       </div>
     </div>
   );

@@ -10,7 +10,7 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
-import type { Project } from "./types";
+import type { Prefs, Project } from "./types";
 
 const DIR = path.join(process.cwd(), ".riff");
 const FILE = path.join(DIR, "riff.db");
@@ -32,7 +32,23 @@ function db(): Database.Database {
     updated_at INTEGER,
     data TEXT NOT NULL
   );
-  CREATE INDEX IF NOT EXISTS idx_projects_updated ON projects(updated_at DESC);`);
+  CREATE INDEX IF NOT EXISTS idx_projects_updated ON projects(updated_at DESC);
+  -- What Riff has learned about this user's taste. One row, id 'me'.
+  CREATE TABLE IF NOT EXISTS prefs (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  );
+  -- An append-only event log. The plan's success measures are computed from this
+  -- rather than kept as running counters, so a metric can be redefined later
+  -- without having been collected wrongly all along.
+  CREATE TABLE IF NOT EXISTS metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT,
+    kind TEXT,
+    ts INTEGER,
+    data TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_metrics_kind ON metrics(kind, ts DESC);`);
   // One-time import of any legacy JSON store, so existing users don't lose history.
   try {
     const legacy = path.join(DIR, "projects.json");
@@ -69,6 +85,39 @@ export const store = {
   async del(id: string): Promise<void> {
     db().prepare("DELETE FROM projects WHERE id = ?").run(id);
   },
+  // --- taste (one row, shared across projects) ---
+  async getPrefs(): Promise<Prefs> {
+    const r = db().prepare("SELECT data FROM prefs WHERE id = 'me'").get() as { data: string } | undefined;
+    return r ? (JSON.parse(r.data) as Prefs) : { note: "", signals: [], distilledAt: 0, updatedAt: 0 };
+  },
+  async mutatePrefs(fn: (p: Prefs) => void): Promise<Prefs> {
+    const d = db();
+    const tx = d.transaction((): Prefs => {
+      const cur = d.prepare("SELECT data FROM prefs WHERE id = 'me'").get() as { data: string } | undefined;
+      const p: Prefs = cur ? (JSON.parse(cur.data) as Prefs) : { note: "", signals: [], distilledAt: 0, updatedAt: 0 };
+      fn(p);
+      p.updatedAt = Date.now();
+      d.prepare("INSERT OR REPLACE INTO prefs(id, data) VALUES('me', ?)").run(JSON.stringify(p));
+      return p;
+    });
+    return tx();
+  },
+
+  // --- metrics (append-only; never throws, never blocks a build) ---
+  recordMetric(projectId: string, kind: string, data: Record<string, unknown>): void {
+    try {
+      db().prepare("INSERT INTO metrics(project_id, kind, ts, data) VALUES(?,?,?,?)")
+        .run(projectId, kind, Date.now(), JSON.stringify(data));
+    } catch { /* telemetry must never break a build */ }
+  },
+  readMetrics(sinceMs = 0): { projectId: string; kind: string; ts: number; data: Record<string, unknown> }[] {
+    try {
+      return (db().prepare("SELECT project_id, kind, ts, data FROM metrics WHERE ts >= ? ORDER BY ts ASC").all(sinceMs) as
+        { project_id: string; kind: string; ts: number; data: string }[])
+        .map((r) => ({ projectId: r.project_id, kind: r.kind, ts: r.ts, data: JSON.parse(r.data) as Record<string, unknown> }));
+    } catch { return []; }
+  },
+
   // Atomic read-modify-write in a single SQLite transaction: read the latest row,
   // apply `fn`, write it back — so a minutes-long fork round updates only its own
   // fields without clobbering a concurrent keep/discard or DB attach.

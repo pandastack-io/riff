@@ -1,18 +1,25 @@
 import { NextRequest } from "next/server";
 import { store } from "@/lib/store";
 import { runAgentTurn, type BriefDecision } from "@/lib/agent";
+import { parseDataset } from "@/lib/data";
 import type { AgentStep } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
-  const { projectId, prompt, imageDataUrl, decisions, resume } = await req.json();
+  const { projectId, prompt, imageDataUrl, decisions, resume, dataFile, tasteSignal } = await req.json();
   const project = await store.get(projectId);
   if (!project) return new Response(JSON.stringify({ error: "project not found" }), { status: 404 });
   const text = String(prompt || "").trim();
   const image = typeof imageDataUrl === "string" && imageDataUrl.startsWith("data:image/") ? imageDataUrl : undefined;
-  if (!text && !image) return new Response(JSON.stringify({ error: "empty prompt" }), { status: 400 });
+  if (!text && !image && !dataFile) return new Response(JSON.stringify({ error: "empty prompt" }), { status: 400 });
+
+  // The raw file is parsed HERE, not trusted from the client: identifiers are
+  // re-derived and the contents only ever reach a model quoted as data.
+  const dataset = dataFile && typeof dataFile.name === "string" && typeof dataFile.text === "string"
+    ? parseDataset(dataFile.name, dataFile.text.slice(0, 400_000)) ?? undefined
+    : undefined;
 
   // A resume is the user answering the Brief's one question. The original prompt
   // is already in the transcript — log the ANSWER instead of repeating the ask.
@@ -39,6 +46,10 @@ export async function POST(req: NextRequest) {
         const updated = await runAgentTurn(project, text || "Reproduce the attached design.", emit, {
           imageDataUrl: image,
           decisions: picks,
+          dataset,
+          tasteSignal: tasteSignal && (tasteSignal.kind === "flip" || tasteSignal.kind === "correction")
+            ? { kind: tasteSignal.kind, text: String(tasteSignal.text || "").slice(0, 300) }
+            : undefined,
           onEvent: send,
         });
         send("done", updated);

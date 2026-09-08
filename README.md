@@ -45,6 +45,8 @@ Lovable, v0, and bolt are closed SaaS, and every one of them hits the same walls
 - **⑂ Fork-to-explore** — one prompt → N live branches (app + cloned DB) side by side → keep the winner. **The moat.**
 - **⑉ Understands the ask** — before it builds, Riff writes a **Brief**: what it understood, what it is assuming, and the checks the finished app must pass. When a prompt genuinely reads two ways, it doesn't interrogate you — it builds the likely one and offers to **fork the running app into the other reading** so you can pick by looking.
 - **Acceptance-checked builds** — after the app is live, Riff screenshots it and judges it against the Brief. A blank page, a crashed component, or a *"chart coming soon"* placeholder is a **failure**, not a success, and goes straight back into the self-fix loop.
+- **⛁ Bring your own data** — drop a CSV or JSON in with the prompt. Riff reads the real columns, builds the UI around your actual rows, and (with Postgres attached) loads the whole file into a real table first.
+- **It learns what you like** — every time you keep one forked variation over another you are teaching it. Riff distils that into a short, editable note and applies it to later builds. No preferences form; no other builder has the signal.
 - **Model-agnostic** — OpenAI or Anthropic; a deterministic template generator runs with no key at all.
 
 ## Quickstart
@@ -74,7 +76,7 @@ Then open **http://localhost:4321**, describe an app, and watch it come up live.
  Riff orchestrator (Next.js route handlers)
    ├─ intent layer: prompt → Brief (understanding, assumptions, acceptance)
    ├─ agent loop: generate → write → run → observe logs → self-fix → live
-   ├─ verify: screenshot the LIVE app → judge vs the Brief → fix the misses
+   ├─ verify: screenshot the LIVE app, click through it → judge vs the Brief → fix
    ├─ codegen providers (OpenAI / Anthropic / template)
    └─ PandaStack SDK client  ── never runs generated code itself
          │
@@ -103,12 +105,14 @@ hardware. Apache-2.0/MIT; no lock-in.
 
 Built and live-verified: prompt→app, multi-framework, checkpoints, managed
 Postgres, image-to-code, in-app image generation, the theme panel, the
-fork-to-explore moat, and the **intent layer** — the Brief, fork-to-resolve, and
-acceptance checking against the running app.
-
-The plan behind the intent layer, including the phases not yet built (context-aware
-follow-ups, learning your taste, building over a CSV you drop in), is written up in
+fork-to-explore moat, and the whole **intent layer** — the Brief, fork-to-resolve,
+acceptance checking (including scripted interactions) against the running app,
+context-aware follow-ups, data drop, and taste memory. The plan, what it cost, and
+what building it taught us is written up in
 [docs/understanding-plan.md](docs/understanding-plan.md).
+
+`GET /api/metrics` reports whether any of it is actually working, computed from a
+local event log. Nothing leaves your machine.
 
 Next: one-command self-host, a public gallery of live apps, and two-way GitHub sync.
 

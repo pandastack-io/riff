@@ -7,17 +7,19 @@
 // acceptance list, then feeding the misses back into the agent's existing self-fix
 // loop as ordinary feedback.
 //
-// Evidence is captured by driving the system Chrome in headless mode over the
-// preview URL — no new npm dependency, no bundled browser, and nothing to install
-// on a self-hosted box that already has Chrome. If Chrome is not found we report
-// "unverifiable" honestly rather than guessing.
+// Evidence is captured by driving the SYSTEM Chrome over the preview URL: a plain
+// headless invocation for the screenshot and the DOM, and playwright-core (which
+// ships no browser of its own) when a criterion needs the app to actually be used.
+// Nothing is downloaded at install time, and a self-hosted box that already has
+// Chrome needs nothing else. If Chrome is not found we report "unverifiable"
+// honestly rather than guessing.
 import { execFile } from "child_process";
 import { promises as fs } from "fs";
 import os from "os";
 import path from "path";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import type { AcceptanceItem, AcceptanceVerdict } from "./types";
+import type { AcceptanceAction, AcceptanceItem, AcceptanceVerdict } from "./types";
 
 const SHOT_W = 1024, SHOT_H = 768;
 const CHROME_TIMEOUT = 45000;
@@ -152,6 +154,87 @@ export async function captureEvidence(url: string): Promise<Evidence | null> {
   }
 }
 
+// --- interactions -------------------------------------------------------------
+// Some claims are only true after someone uses the app: "pressing Start makes the
+// countdown run". A static screenshot can never judge those, so for exactly those
+// items we drive a real browser through the Brief's scripted steps and screenshot
+// the result. Capped hard — this is a build check, not a test suite.
+
+const MAX_INTERACTIONS = 2;
+const ACTION_TIMEOUT = 6000;
+
+export interface InteractionShot { id: string; text: string; did: string[]; png: Buffer | null }
+
+// Targets come from a model and name what a person would SEE, so resolve them the
+// way a person would: by role, label, placeholder, then any visible text.
+function resolve(page: import("playwright-core").Page, target: string) {
+  return page.getByRole("button", { name: target })
+    .or(page.getByRole("link", { name: target }))
+    .or(page.getByLabel(target))
+    .or(page.getByPlaceholder(target))
+    .or(page.getByText(target))
+    .first();
+}
+
+export async function runInteractions(url: string, items: AcceptanceItem[]): Promise<InteractionShot[]> {
+  const chrome = await findChrome();
+  const todo = items.filter((i) => i.check === "interaction" && (i.actions || []).length).slice(0, MAX_INTERACTIONS);
+  if (!chrome || !todo.length) return [];
+
+  let browser: import("playwright-core").Browser | null = null;
+  const shots: InteractionShot[] = [];
+  try {
+    const { chromium } = await import("playwright-core");
+    const args: string[] = [];
+    if (process.env.RIFF_VERIFY_NO_SANDBOX === "1") args.push("--no-sandbox", "--disable-dev-shm-usage");
+    browser = await chromium.launch({
+      executablePath: chrome, args,
+      ignoreDefaultArgs: ["--mute-audio"],
+      timeout: 20000,
+    });
+    const page = await browser.newPage({
+      viewport: { width: SHOT_W, height: SHOT_H },
+      ignoreHTTPSErrors: process.env.RIFF_VERIFY_INSECURE === "1",
+    });
+
+    for (const item of todo) {
+      const did: string[] = [];
+      try {
+        // Each item starts from a fresh load, so one item cannot poison the next.
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+        await page.waitForTimeout(700);
+        for (const a of (item.actions || []) as AcceptanceAction[]) {
+          try {
+            if (a.kind === "wait") {
+              const ms = Math.min(Math.max(parseInt(a.value, 10) || 500, 100), 4000);
+              await page.waitForTimeout(ms);
+              did.push(`waited ${ms}ms`);
+            } else if (a.kind === "click") {
+              await resolve(page, a.target).click({ timeout: ACTION_TIMEOUT });
+              did.push(`clicked "${a.target}"`);
+            } else {
+              await resolve(page, a.target).fill(a.value, { timeout: ACTION_TIMEOUT });
+              did.push(`typed "${a.value}" into "${a.target}"`);
+            }
+          } catch {
+            // A step that cannot run IS the finding — the button probably is not there.
+            did.push(`could not ${a.kind} "${a.target}"`);
+          }
+        }
+        await page.waitForTimeout(400);
+        shots.push({ id: item.id, text: item.text, did, png: await page.screenshot() });
+      } catch {
+        shots.push({ id: item.id, text: item.text, did: [...did, "the page could not be driven"], png: null });
+      }
+    }
+  } catch {
+    return shots; // playwright missing or Chrome refused to launch — fall back to static
+  } finally {
+    await browser?.close().catch(() => {});
+  }
+  return shots;
+}
+
 // --- the judge ---------------------------------------------------------------
 
 const JUDGE_SYSTEM = `You are the acceptance checker for Riff, an AI app builder.
@@ -162,6 +245,8 @@ You are given a screenshot and the visible text of a web app that was just gener
 - "unverifiable": it cannot be judged from a single static screenshot (for example it needs a click, a timer to elapse, or a login).
 
 Be strict but fair. Judge only what the evidence shows. Do NOT mark something "fail" merely because you cannot see it in a static screenshot — that is "unverifiable". Do mark "fail" when the thing should obviously be visible and plainly is not, when the page is blank, or when an error is on screen.
+
+You may also be given "after" screenshots, each taken once a scripted interaction was performed on a freshly loaded page. Judge that criterion from ITS OWN after-screenshot, not the first one. If the log says a step could not be performed — a button could not be found or clicked — that criterion is a "fail", because the control the user asked for is not usable.
 
 A LABEL IS NOT THE FEATURE. Text that merely names or promises something does not satisfy a criterion about that thing. "Chart coming soon", a heading reading "Graph showing sales trends" with no plotted data, an empty bordered box captioned "Map", a button that obviously does nothing — all of these are "fail", not "pass". A criterion about a chart, graph, or visualisation is satisfied only by actually drawn marks: bars, a line, plotted points, arcs. Placeholder and lorem content is a "fail" every time.
 
@@ -188,8 +273,10 @@ const JUDGE_SCHEMA = {
   required: ["verdicts"],
 } as const;
 
-function judgePrompt(items: AcceptanceItem[], ev: Evidence): string {
+function judgePrompt(items: AcceptanceItem[], ev: Evidence, shots: InteractionShot[] = []): string {
   const L = [`Acceptance criteria:\n${items.map((a) => `[${a.id}] ${a.text}`).join("\n")}`];
+  if (shots.length)
+    L.push(`Interactions performed, each on a fresh page load. The screenshots after the first are these, in order:\n${shots.map((s2, i) => `Screenshot ${i + 2} — for [${s2.id}]: ${s2.did.join(", ") || "nothing"}`).join("\n")}`);
   if (ev.errorOverlay) L.push(`NOTE: the page is displaying a development error: ${ev.errorOverlay}. Every criterion that depends on the app working should FAIL.`);
   if (ev.blank) L.push(`NOTE: the page rendered essentially no visible content. It is blank.`);
   L.push(`Visible text on the page:\n${ev.visibleText || "(none)"}`);
@@ -197,10 +284,11 @@ function judgePrompt(items: AcceptanceItem[], ev: Evidence): string {
   return L.join("\n\n");
 }
 
-async function judgeOpenAI(items: AcceptanceItem[], ev: Evidence): Promise<AcceptanceVerdict[]> {
+async function judgeOpenAI(items: AcceptanceItem[], ev: Evidence, shots: InteractionShot[]): Promise<AcceptanceVerdict[]> {
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const content: OpenAI.Chat.ChatCompletionContentPart[] = [{ type: "text", text: judgePrompt(items, ev) }];
+  const content: OpenAI.Chat.ChatCompletionContentPart[] = [{ type: "text", text: judgePrompt(items, ev, shots) }];
   if (ev.screenshot) content.push({ type: "image_url", image_url: { url: `data:image/png;base64,${ev.screenshot.toString("base64")}` } });
+  for (const s2 of shots) if (s2.png) content.push({ type: "image_url", image_url: { url: `data:image/png;base64,${s2.png.toString("base64")}` } });
   const r = await client.chat.completions.create({
     model: process.env.OPENAI_MODEL || "gpt-4o",
     messages: [{ role: "system", content: JUDGE_SYSTEM }, { role: "user", content }],
@@ -212,11 +300,12 @@ async function judgeOpenAI(items: AcceptanceItem[], ev: Evidence): Promise<Accep
   return (JSON.parse(raw) as { verdicts: AcceptanceVerdict[] }).verdicts;
 }
 
-async function judgeAnthropic(items: AcceptanceItem[], ev: Evidence): Promise<AcceptanceVerdict[]> {
+async function judgeAnthropic(items: AcceptanceItem[], ev: Evidence, shots: InteractionShot[]): Promise<AcceptanceVerdict[]> {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const blocks: Anthropic.ContentBlockParam[] = [];
   if (ev.screenshot) blocks.push({ type: "image", source: { type: "base64", media_type: "image/png", data: ev.screenshot.toString("base64") } });
-  blocks.push({ type: "text", text: judgePrompt(items, ev) });
+  for (const s2 of shots) if (s2.png) blocks.push({ type: "image", source: { type: "base64", media_type: "image/png", data: s2.png.toString("base64") } });
+  blocks.push({ type: "text", text: judgePrompt(items, ev, shots) });
   const msg = await client.messages.create({
     model: process.env.ANTHROPIC_MODEL || "claude-opus-4-8",
     max_tokens: 1500,
@@ -235,6 +324,7 @@ export interface VerifyResult {
   ok: boolean;            // nothing failed
   skipped?: string;       // why the pass didn't run, when it didn't
   evidenceNote?: string;  // the hard signal, if any (blank page / error overlay)
+  interactions?: number;  // how many scripted interactions were driven
 }
 
 // Verify a live app against its Brief. Never throws — a broken judge must not
@@ -248,8 +338,10 @@ export async function verifyApp(url: string, acceptance: AcceptanceItem[]): Prom
   if (!ev) return { verdicts: [], ok: true, skipped: "no headless Chrome found on the server (set CHROME_PATH)" };
 
   const hard = ev.errorOverlay || (ev.blank ? "the page rendered blank" : null);
+  // Only worth driving a browser if the page is actually up.
+  const shots = hard ? [] : await runInteractions(url, acceptance).catch(() => [] as InteractionShot[]);
   try {
-    const raw = process.env.OPENAI_API_KEY ? await judgeOpenAI(acceptance, ev) : await judgeAnthropic(acceptance, ev);
+    const raw = process.env.OPENAI_API_KEY ? await judgeOpenAI(acceptance, ev, shots) : await judgeAnthropic(acceptance, ev, shots);
     const byId = new Map(raw.map((v) => [v.id, v]));
     const verdicts: AcceptanceVerdict[] = acceptance.map((a) => {
       const v = byId.get(a.id);
@@ -257,7 +349,7 @@ export async function verifyApp(url: string, acceptance: AcceptanceItem[]): Prom
         ? { id: a.id, status: v.status, reason: v.reason || "", fix: v.fix || undefined }
         : { id: a.id, status: "unverifiable" as const, reason: "the checker did not return a verdict" };
     });
-    return { verdicts, ok: !verdicts.some((v) => v.status === "fail"), evidenceNote: hard || undefined };
+    return { verdicts, ok: !verdicts.some((v) => v.status === "fail"), evidenceNote: hard || undefined, interactions: shots.length };
   } catch {
     // The judge failed. A hard signal from the evidence is still worth reporting.
     if (hard) {

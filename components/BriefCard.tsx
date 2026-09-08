@@ -17,14 +17,18 @@ const TICK: Record<VerdictStatus, { mark: string; tone: string }> = {
   unverifiable: { mark: "–", tone: "text-[var(--faint)]" },
 };
 
-export function BriefCard({ brief, needsInput, busy, canFork, onAnswer, onFlip, onExplore }: {
+export function BriefCard({ brief, needsInput, busy, canFork, autoExplore, taste, onAnswer, onFlip, onExplore, onToggleAuto, onForgetTaste }: {
   brief: Brief;
   needsInput: BriefAmbiguity | null;
   busy: boolean;
   canFork: boolean;
+  autoExplore: boolean;
+  taste: { note: string; signals: number } | null;
   onAnswer: (a: BriefAmbiguity, readingLabel: string, directive: string) => void;
   onFlip: (a: BriefAssumption) => void;
   onExplore: (a: BriefAmbiguity) => void;
+  onToggleAuto: (v: boolean) => void;
+  onForgetTaste: () => void;
 }) {
   const [open, setOpen] = useState(true);
   const verdicts = brief.verdicts || [];
@@ -89,11 +93,20 @@ export function BriefCard({ brief, needsInput, busy, canFork, onAnswer, onFlip, 
                   <span key={r.label}>{i > 0 ? " or " : ""}<span className="text-[var(--ink)]">{r.label}</span></span>
                 ))}.
               </div>
-              <button disabled={!canFork} onClick={() => onExplore(a)}
-                title={canFork ? "Fork the running app into the other readings" : "Wait for the app to be live"}
-                className="mt-2 rounded-lg border border-[var(--accent)]/40 bg-[var(--accent-dim)]/15 px-2.5 py-1 text-[11.5px] font-medium text-[var(--accent)] transition hover:bg-[var(--accent-dim)]/25 disabled:opacity-40">
-                ⑂ Show me both, side by side
-              </button>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button disabled={!canFork} onClick={() => onExplore(a)}
+                  title={canFork ? "Fork the running app into the other readings" : "Wait for the app to be live"}
+                  className="rounded-lg border border-[var(--accent)]/40 bg-[var(--accent-dim)]/15 px-2.5 py-1 text-[11.5px] font-medium text-[var(--accent)] transition hover:bg-[var(--accent-dim)]/25 disabled:opacity-40">
+                  ⑂ Show me {a.readings.length === 2 ? "both" : "all " + a.readings.length}, side by side
+                </button>
+                {/* Off by default: forking spends a codegen per reading, so it stays
+                    something you opt into rather than something that just happens. */}
+                <label className="flex cursor-pointer select-none items-center gap-1.5 text-[10.5px] text-[var(--faint)] transition hover:text-[var(--muted)]">
+                  <input type="checkbox" checked={autoExplore} onChange={(e) => onToggleAuto(e.target.checked)}
+                    className="h-3 w-3 accent-[var(--accent)]" />
+                  always do this
+                </label>
+              </div>
             </div>
           ))}
 
@@ -137,6 +150,18 @@ export function BriefCard({ brief, needsInput, busy, canFork, onAnswer, onFlip, 
             <Row label="Decided">
               <span className="text-[12px] text-[var(--muted)]">{brief.decisions.map((d) => d.readingLabel).join(" · ")}</span>
             </Row>
+          )}
+
+          {/* Learned, not asked for — so it has to be visible and easy to disown. */}
+          {taste?.note && (
+            <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-2.5">
+              <div className="mb-1 flex items-center gap-2">
+                <span className="text-[10.5px] uppercase tracking-wide text-[var(--faint)]">Your taste</span>
+                <span className="mono text-[9.5px] text-[var(--faint)]">from {taste.signals} choice{taste.signals === 1 ? "" : "s"}</span>
+                <button onClick={onForgetTaste} className="ml-auto text-[10.5px] text-[var(--faint)] transition hover:text-rose-300">forget</button>
+              </div>
+              <p className="text-[11.5px] leading-relaxed text-[var(--muted)]">{taste.note}</p>
+            </div>
           )}
 
           {busy && !needsInput && (

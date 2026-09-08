@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type Lenis from "lenis";
 import type { Project } from "@/lib/types";
-import { EXAMPLES, PromptComposer, ProjectCard, Logo, type FwChoice } from "@/components/riff-ui";
+import { EXAMPLES, PromptComposer, ProjectCard, Logo, type FwChoice, type DataFile } from "@/components/riff-ui";
 
 import { HeroDemo } from "@/components/landing/HeroDemo";
 
@@ -21,15 +21,15 @@ export default function Landing() {
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
 
-  const start = useCallback(async (prompt: string, fw: FwChoice, image?: string) => {
+  const start = useCallback(async (prompt: string, fw: FwChoice, image?: string, data?: DataFile) => {
     const trimmed = prompt.trim();
-    if (!trimmed && !image) return;
+    if (!trimmed && !image && !data) return;
     const r = await fetch("/api/projects", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: (trimmed || "From a design").slice(0, 40), framework: fw }),
     });
     const p: Project = await r.json();
-    try { sessionStorage.setItem(`riff:pending:${p.id}`, JSON.stringify({ prompt: trimmed, imageDataUrl: image })); } catch { /* ignore */ }
+    try { sessionStorage.setItem(`riff:pending:${p.id}`, JSON.stringify({ prompt: trimmed, imageDataUrl: image, dataFile: data ? { name: data.name, text: data.text } : undefined })); } catch { /* ignore */ }
     router.push(`/project/${p.id}`);
   }, [router]);
 

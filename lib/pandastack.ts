@@ -105,9 +105,23 @@ export const pandastack = {
     } catch { return false; }
   },
 
+  // Writes are the single most frequent call and the one most exposed to transient
+  // guest-side hiccups (a busy vsock bridge, a slow first write after a boot), so
+  // a couple of quick retries here save whole builds that were otherwise fine.
   async writeFile(id: string, path: string, content: string): Promise<void> {
-    const r = await req("PUT", `/v1/sandboxes/${id}/fs?path=${encodeURIComponent(path)}`, undefined, content);
-    if (!r.ok) throw new Error(`write ${path}: ${r.status} ${await r.text()}`);
+    let last = "";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await req("PUT", `/v1/sandboxes/${id}/fs?path=${encodeURIComponent(path)}`, undefined, content);
+        if (r.ok) return;
+        last = `${r.status} ${await r.text()}`;
+        if (r.status < 500 && r.status !== 429) break; // a real rejection, not a hiccup
+      } catch (e) {
+        last = e instanceof Error ? e.message : String(e);
+      }
+      await new Promise((res) => setTimeout(res, 600 * (attempt + 1)));
+    }
+    throw new Error(`write ${path}: ${last}`);
   },
 
   // Write raw bytes (e.g. a generated PNG) into the sandbox filesystem.

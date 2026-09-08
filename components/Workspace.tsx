@@ -25,14 +25,33 @@ export default function Workspace({ projectId }: { projectId: string }) {
   const [iframeKey, setIframeKey] = useState(0);
   // The one question the Brief decided was worth blocking on, if any.
   const [needsInput, setNeedsInput] = useState<BriefAmbiguity | null>(null);
+  // Opt-in: fork the open reading as soon as the app is live, without being asked.
+  const [autoExplore, setAutoExplore] = useState(false);
+  const [taste, setTaste] = useState<{ note: string; signals: number } | null>(null);
+  const autoFiredFor = useRef<string | null>(null);
   const stepsRef = useRef<HTMLDivElement>(null);
   const busyRef = useRef(false);
   // The prompt the current brief was built from — replayed verbatim when the user
-  // answers the question, so the build continues from the same ask.
+  // answers the question, so the build continues from the same ask. The attached
+  // data file rides along with it: a question about the data must not lose it.
   const promptRef = useRef("");
+  const dataRef = useRef<{ name: string; text: string } | undefined>(undefined);
   busyRef.current = busy || branchBusy;
 
   useEffect(() => { stepsRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [steps]);
+  useEffect(() => { try { setAutoExplore(localStorage.getItem("riff:autoExplore") === "1"); } catch { /* ignore */ } }, []);
+  const loadTaste = useCallback(async () => {
+    try { const r = await fetch("/api/prefs"); if (r.ok) setTaste(await r.json()); } catch { /* ignore */ }
+  }, []);
+  useEffect(() => { loadTaste(); }, [loadTaste]);
+  const forgetTaste = useCallback(async () => {
+    try { await fetch("/api/prefs", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reset: true }) }); } catch { /* ignore */ }
+    setTaste(null);
+  }, []);
+  const toggleAuto = useCallback((v: boolean) => {
+    setAutoExplore(v);
+    try { localStorage.setItem("riff:autoExplore", v ? "1" : "0"); } catch { /* ignore */ }
+  }, []);
 
   const consume = useCallback(async (res: Response) => {
     if (!res.body) return;
@@ -55,6 +74,8 @@ export default function Workspace({ projectId }: { projectId: string }) {
         else if (ev === "brief") setProject((p) => p ? { ...p, brief: payload as Brief } : p);
         else if (ev === "verify") setProject((p) => p?.brief ? { ...p, brief: { ...p.brief, verdicts: payload.verdicts as AcceptanceVerdict[] } } : p);
         else if (ev === "needsInput") setNeedsInput(payload.ambiguity as BriefAmbiguity);
+        // A follow-up that undoes something already chosen. Surfaced, not blocked.
+        else if (ev === "conflict") setToast({ text: (payload.conflicts as string[]).join(" · "), tone: "err" });
         else if (ev === "done") { setProject(payload as Project); setIframeKey((k) => k + 1); }
         else if (ev === "fatal") setProject((p) => p ? { ...p, status: "error", error: payload.error } : p);
       }
@@ -64,10 +85,15 @@ export default function Workspace({ projectId }: { projectId: string }) {
   const runTurn = useCallback(async (
     prompt: string,
     imageDataUrl?: string,
-    extra?: { decisions?: { ambiguityId: string; readingLabel: string; directive?: string }[]; resume?: boolean },
+    extra?: {
+      decisions?: { ambiguityId: string; readingLabel: string; directive?: string }[];
+      resume?: boolean;
+      dataFile?: { name: string; text: string };
+      tasteSignal?: { kind: "flip" | "correction"; text: string };
+    },
   ) => {
     setBusy(true);
-    if (!extra?.resume) promptRef.current = prompt;
+    if (!extra?.resume) { promptRef.current = prompt; dataRef.current = extra?.dataFile; }
     setNeedsInput(null);
     try {
       const res = await fetch("/api/chat", {
@@ -91,12 +117,12 @@ export default function Workspace({ projectId }: { projectId: string }) {
       const p: Project = await r.json();
       if (cancelled) return;
       setProject(p);
-      let pending: { prompt?: string; imageDataUrl?: string } | null = null;
+      let pending: { prompt?: string; imageDataUrl?: string; dataFile?: { name: string; text: string } } | null = null;
       try { const raw = sessionStorage.getItem(`riff:pending:${projectId}`); if (raw) { pending = JSON.parse(raw); sessionStorage.removeItem(`riff:pending:${projectId}`); } } catch { /* ignore */ }
       if (pending) {
         const prompt = pending.prompt || "";
         setProject((cur) => cur ? { ...cur, messages: [...cur.messages, { id: "u0", role: "user", text: prompt || "Reproduce this design.", ts: Date.now() }] } : cur);
-        runTurn(prompt || "Reproduce the attached design faithfully.", pending.imageDataUrl);
+        runTurn(prompt || "Reproduce the attached design faithfully.", pending.imageDataUrl, { dataFile: pending.dataFile });
       } else {
         // Reopening: restore the persisted build trace so the conversation looks
         // exactly as it did live, then wake the (possibly hibernated) sandbox.
@@ -131,7 +157,7 @@ export default function Workspace({ projectId }: { projectId: string }) {
     setNeedsInput(null);
     const base = promptRef.current || [...(project?.messages || [])].reverse().find((m) => m.role === "user")?.text || "";
     setProject((p) => p ? { ...p, messages: [...p.messages, { id: "u" + Date.now(), role: "user", text: readingLabel, ts: Date.now() }] } : p);
-    await runTurn(base, undefined, { decisions: [{ ambiguityId: a.id, readingLabel, directive }], resume: true });
+    await runTurn(base, undefined, { decisions: [{ ambiguityId: a.id, readingLabel, directive }], resume: true, dataFile: dataRef.current });
   }, [busy, project, runTurn]);
 
   // Flipping an assumption chip is just a very well-specified follow-up build.
@@ -139,7 +165,7 @@ export default function Workspace({ projectId }: { projectId: string }) {
     if (busy || !project) return;
     const prompt = `Change one thing: instead of ${a.text}, ${a.alternative}. Keep everything else about the app exactly as it is.`;
     setProject({ ...project, messages: [...project.messages, { id: "u" + Date.now(), role: "user", text: a.alternative, ts: Date.now() }] });
-    await runTurn(prompt);
+    await runTurn(prompt, undefined, { tasteSignal: { kind: "flip", text: `chose "${a.alternative}" over "${a.text}"` } });
   }, [busy, project, runTurn]);
 
   const restore = useCallback(async (checkpointId: string) => {
@@ -237,6 +263,7 @@ export default function Workspace({ projectId }: { projectId: string }) {
       const label = updated.branches?.find((b) => b.id === branchId)?.label;
       setProject(updated); setIframeKey((k) => k + 1);
       setToast({ text: `Kept variation ${label ?? ""} — it's your main line now`, tone: "ok" });
+      setTimeout(loadTaste, 2500); // the note is distilled just after the keep lands
     } finally { setBranchBusy(false); }
   }, [project]);
 
@@ -249,6 +276,18 @@ export default function Workspace({ projectId }: { projectId: string }) {
       setToast({ text: keepTrunk ? "Kept the original — that's your main line" : "Discarded the branches — back to your main line", tone: "ok" });
     } finally { setBranchBusy(false); }
   }, [project]);
+
+  // Auto-explore: once the app is live and idle, fork the top open reading without
+  // being asked. Guarded per-ambiguity so it fires once, never in a loop.
+  useEffect(() => {
+    if (!autoExplore || !project?.brief || busy || branchBusy || project.activeRoundId) return;
+    if (project.status !== "live" || !project.sandboxId) return;
+    const decided = new Set(project.brief.decisions.map((d) => d.ambiguityId));
+    const open = project.brief.ambiguities.find((a) => !decided.has(a.id) && a.impact === "high" && a.readings.length >= 2);
+    if (!open || autoFiredFor.current === open.id) return;
+    autoFiredFor.current = open.id;
+    exploreReadings(open);
+  }, [autoExplore, project, busy, branchBusy, exploreReadings]);
 
   if (notFound) return <div className="grid h-screen place-items-center text-sm text-[var(--faint)]">Project not found. <button onClick={() => router.push("/")} className="ml-2 text-[var(--accent)]">Go home →</button></div>;
   if (!project) return <div className="grid h-screen place-items-center text-sm text-[var(--muted)]">Loading…</div>;
@@ -278,8 +317,9 @@ export default function Workspace({ projectId }: { projectId: string }) {
             {project.brief && (
               <BriefCard
                 brief={project.brief} needsInput={needsInput} busy={busy}
-                canFork={canBranch}
+                canFork={canBranch} autoExplore={autoExplore} taste={taste}
                 onAnswer={answerQuestion} onFlip={flipAssumption} onExplore={exploreReadings}
+                onToggleAuto={toggleAuto} onForgetTaste={forgetTaste}
               />
             )}
             {project.messages.map((m) => (

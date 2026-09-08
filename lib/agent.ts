@@ -3,8 +3,10 @@ import { store } from "./store";
 import { frameworkFor, APP_DIR, type FrameworkSpec } from "./frameworks";
 import { pickProvider } from "./codegen";
 import { imageGenEnabled, findGenRefs, promptFromSlug, generateImage } from "./imagegen";
-import { generateBrief, briefToPrompt, blockingQuestion } from "./intent";
+import { generateBrief, briefToPrompt, blockingQuestion, interpretFollowUp, applyFollowUp, type FollowUpPlan } from "./intent";
 import { verifyEnabled, verifyApp, verdictsToFeedback, type VerifyResult } from "./verify";
+import { datasetToPrompt, seedScript, type Dataset } from "./data";
+import { tasteToPrompt, recordSignal, maybeDistil } from "./taste";
 import type { Project, AgentStep, FileEntry, Checkpoint, Branch, BranchRound, BranchStatus, Brief } from "./types";
 
 const MAX_GEN_IMAGES = 4;
@@ -27,6 +29,8 @@ export interface BriefDecision { ambiguityId: string; readingLabel: string; dire
 export interface TurnOptions {
   imageDataUrl?: string;
   decisions?: BriefDecision[];
+  dataset?: Dataset;          // a CSV/JSON the user dropped in with the prompt
+  tasteSignal?: { kind: "flip" | "correction"; text: string };
   // Coarse side-channel for events that are not build steps (the Brief card, the
   // acceptance verdicts, the one blocking question).
   onEvent?: (event: string, data: unknown) => void;
@@ -39,25 +43,67 @@ export async function runAgentTurn(project: Project, prompt: string, emit: StepS
   const push = async (s: AgentStep) => { emit(s); project.steps.push(s); await save(project); };
   const fire = opts.onEvent || (() => {});
 
+  const turnStartedAt = Date.now();
+  const firstBuild = !project.sandboxId && !project.brief;
   try {
     const dbAttached = !!(project.database && project.database.status === "running");
     const hadTrunk = !!project.sandboxId;
     const resuming = !!opts.decisions?.length;
+    if (opts.tasteSignal) recordSignal(opts.tasteSignal.kind, opts.tasteSignal.text).catch(() => {});
 
-    // 0. UNDERSTAND FIRST. The Brief says what Riff thinks the user asked for,
-    //    before a line of code exists. It runs on a fast model CONCURRENTLY with
-    //    the microVM boot, so on the common path it costs no wall-clock at all.
-    //    On a resume (the user just answered the one question) the stored Brief is
-    //    reused — regenerating it would mint new ambiguity ids and re-ask forever.
-    const briefP: Promise<Brief> = resuming && project.brief
-      ? Promise.resolve(project.brief)
-      : generateBrief({ prompt, framework: fw, existingBrief: project.brief, dbAttached, imageDataUrl: opts.imageDataUrl });
+    // 0. UNDERSTAND FIRST, and understand the RIGHT thing. A first prompt gets a
+    //    fresh Brief. A follow-up gets interpreted against the Brief and the code
+    //    that already exist, so "make it bigger" arrives at codegen naming the
+    //    element and the value. A resume reuses the stored Brief untouched —
+    //    regenerating would mint new ambiguity ids and re-ask forever.
+    //    All of it runs on a fast model CONCURRENTLY with the microVM boot, so on
+    //    the common path understanding costs no wall-clock at all.
+    const ds = opts.dataset;
+    const dataNote = ds ? datasetToPrompt(ds, dbAttached && fw.id === "next") : "";
+    const prefsP = store.getPrefs().catch(() => null);
+
+    const isFollowUp = !resuming && !!project.brief && appSrcFiles(project, fw).length > 0;
+    const understandP: Promise<{ brief: Brief; plan: FollowUpPlan | null }> = (async () => {
+      if (resuming && project.brief) return { brief: project.brief, plan: null };
+      if (isFollowUp) {
+        const plan = await interpretFollowUp({
+          prompt, brief: project.brief!, framework: fw,
+          existingAppFiles: appSrcFiles(project, fw),
+          recentMessages: project.messages.slice(-6).map((m) => ({ role: m.role, text: m.text })),
+        });
+        // Only a pivot is worth paying for a whole new Brief; a tweak moves nothing
+        // and a feature just moves the checklist.
+        const brief = plan.kind === "pivot"
+          ? await generateBrief({ prompt, framework: fw, existingBrief: project.brief, dbAttached, imageDataUrl: opts.imageDataUrl })
+          : applyFollowUp(project.brief!, plan);
+        return { brief, plan };
+      }
+      return {
+        brief: await generateBrief({ prompt, framework: fw, existingBrief: project.brief, dbAttached, imageDataUrl: opts.imageDataUrl, datasetNote: dataNote }),
+        plan: null,
+      };
+    })();
+
     const sandboxP = ensureSandbox(project, fw, push);
     sandboxP.catch(() => {}); // the real await below is what surfaces a boot failure
 
-    project.brief = await briefP;
+    const { brief, plan } = await understandP;
+    project.brief = brief;
     applyDecisions(project.brief, opts.decisions);
-    await push(step("brief", `Understood — ${project.brief.title}`, project.brief.oneLiner));
+    // What actually gets built: the resolved rewrite on a follow-up, else the ask.
+    const effectivePrompt = plan?.rewrite?.trim() || prompt;
+
+    if (plan) {
+      const KIND: Record<FollowUpPlan["kind"], string> = { tweak: "A tweak", feature: "A new capability", pivot: "A pivot" };
+      await push(step("brief", `${KIND[plan.kind]} — ${project.brief.title}`, plan.rewrite.slice(0, 160)));
+      // Non-blocking on purpose: a warning you can see beats a dialog on every edit.
+      if (plan.conflicts.length) {
+        await push(step("fix", "Heads up — this undoes something you chose", plan.conflicts.join(" · ")));
+        fire("conflict", { conflicts: plan.conflicts });
+      }
+    } else {
+      await push(step("brief", `Understood — ${project.brief.title}`, project.brief.oneLiner));
+    }
     fire("brief", project.brief);
     await save(project);
 
@@ -77,19 +123,39 @@ export async function runAgentTurn(project: Project, prompt: string, emit: StepS
     // 2. Ensure a live sandbox (re-boots if the old one was reaped).
     const { sid, fresh } = await sandboxP;
 
-    // 3. Codegen — against the Brief, not just the raw prompt.
-    const briefBlock = briefToPrompt(project.brief);
+    // 2b. Load the dropped data into Postgres BEFORE codegen, so the app is written
+    //     against a table that already exists and already has rows in it.
+    if (ds && dbAttached && fw.id === "next") {
+      await ensurePg(sid, push);
+      await push(step("db", `Loading ${ds.sourceName} into Postgres…`, `${ds.rowCount} rows → table "${ds.table}"`));
+      await writeFiles(sid, [seedScript(ds)]);
+      const r = await pandastack.exec(
+        sid,
+        `cd ${APP_DIR} && export PATH=/opt/mise/shims:$PATH && DATABASE_URL=${shq(project.database!.connectionUrl || "")} node riff-seed.cjs 2>&1 | tail -3`,
+        120000,
+      ).catch(() => null);
+      const out = (r?.stdout || r?.stderr || "").trim();
+      await push(step("db", out.includes("riff-seed ok") ? `Loaded ${ds.rowCount} rows` : "Could not load the data file", out.slice(-160)));
+    }
+
+    // 3. Codegen — against the Brief, the data, and what this user tends to like.
+    const prefs = await prefsP;
+    const briefBlock = [briefToPrompt(project.brief), dataNote, tasteToPrompt(prefs)].filter(Boolean).join("\n\n");
     project.status = "generating"; await push(step("plan", opts.imageDataUrl ? `Reading your design with ${provider.name}…` : `Generating with ${provider.name}…`));
-    let gen = await provider.generate({ prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), dbAttached, imageDataUrl: opts.imageDataUrl, briefBlock });
+    let gen = await provider.generate({ prompt: effectivePrompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), dbAttached, imageDataUrl: opts.imageDataUrl, briefBlock });
     await push(step("write", "Wrote " + gen.files.map((f) => f.path).join(", "), gen.summary));
 
-    // 4. Sync files (scaffold once per fresh sandbox + app source every turn).
-    const toWrite: FileEntry[] = fresh ? [...fw.scaffold(), ...gen.files] : gen.files;
+    // 4. Sync files. The harness goes on any sandbox that does not already have it
+    //    — which is not the same set as "sandboxes created this turn", see
+    //    Project.scaffoldedSandboxId.
+    const needsHarness = fresh || project.scaffoldedSandboxId !== sid;
+    const toWrite: FileEntry[] = needsHarness ? [...fw.scaffold(), ...gen.files] : gen.files;
     await writeFiles(sid, toWrite);
     project.files = mergeFiles(project.files, toWrite);
 
-    // 5. Install on a fresh sandbox (frameworks that need it).
-    if (fresh && fw.install) await installDeps(sid, fw, project, push);
+    // 5. Install whenever the harness was just written; no harness means no node_modules.
+    if (needsHarness && fw.install) await installDeps(sid, fw, project, push);
+    if (needsHarness) { project.scaffoldedSandboxId = sid; await save(project); }
     // 5b. Ensure the Postgres client is present when a database is attached.
     if (dbAttached && fw.id === "next") await ensurePg(sid, push);
     // 5c. Materialize any AI images the generated code references.
@@ -101,6 +167,7 @@ export async function runAgentTurn(project: Project, prompt: string, emit: StepS
     //        semantic miss is fed back as ordinary feedback, so both gates share
     //        one regenerate-write-restart loop.
     project.status = "starting";
+    const conflicted = !!plan?.conflicts.length;
     let attempt = 0;
     let semantic = 0;
     while (true) {
@@ -111,35 +178,56 @@ export async function runAgentTurn(project: Project, prompt: string, emit: StepS
         project.previewUrl = pandastack.previewUrl(sid, fw.port);
         project.status = "live";
         const vr = await verifyTurn(project, push, fire);
-        if (vr && !vr.ok && semantic < MAX_SEMANTIC_FIX) {
+        // When the user's own request contradicted the checklist, the checklist is
+        // mid-flux and some criteria are stale by design. Auto-fixing then means
+        // undoing what they just asked for, so verdicts are reported and NOT acted
+        // on. The next turn, with a settled brief, resumes fixing normally.
+        if (vr && !vr.ok && conflicted) {
+          await push(step("verify", "Not fixing these — you asked for the change that broke them", "the brief is still catching up"));
+        } else if (vr && !vr.ok && semantic < MAX_SEMANTIC_FIX) {
           semantic++;
           const misses = vr.verdicts.filter((v) => v.status === "fail").length;
           await push(step("fix", `${misses} thing${misses === 1 ? "" : "s"} missing from the brief — fixing`, vr.evidenceNote));
-          project.status = "generating";
-          gen = await provider.generate({
-            prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw),
-            feedback: verdictsToFeedback(project.brief!.acceptance, vr.verdicts),
-            dbAttached, briefBlock,
-          });
-          await writeFiles(sid, gen.files);
-          project.files = mergeFiles(project.files, gen.files);
-          await materializeImages(sid, fw, project, push);
-          continue;
+          // The app is ALREADY live and its verdicts are already reported. This
+          // pass is an improvement on top of that, so if it fails — a slow model,
+          // a dropped write — we keep the working app instead of failing the turn.
+          try {
+            project.status = "generating";
+            gen = await provider.generate({
+              prompt: effectivePrompt, framework: fw, existingAppFiles: appSrcFiles(project, fw),
+              feedback: verdictsToFeedback(project.brief!.acceptance, vr.verdicts),
+              dbAttached, briefBlock,
+            });
+            await writeFiles(sid, gen.files);
+            project.files = mergeFiles(project.files, gen.files);
+            await materializeImages(sid, fw, project, push);
+            continue;
+          } catch (e) {
+            project.status = "live";
+            await push(step("verify", "Could not apply the fix — keeping the version that is live",
+              e instanceof Error ? e.message : String(e)));
+          }
         }
         captureCheckpoint(project, fw, prompt, gen.summary);
+        store.recordMetric(project.id, "turn", {
+          ok: true, firstBuild, kind: plan?.kind ?? "first",
+          ms: Date.now() - turnStartedAt, serveMs: res.ms,
+          semanticFixes: semantic, buildFixes: attempt, conflicted,
+        });
         await push(step("done", `Live in ${(res.ms / 1000).toFixed(1)}s`, project.previewUrl));
         break;
       }
       const log = await tailLog(sid);
       if (attempt >= MAX_FIX) {
         project.status = "error"; project.error = "App did not serve; see build log.";
+        store.recordMetric(project.id, "turn", { ok: false, firstBuild, kind: plan?.kind ?? "first", ms: Date.now() - turnStartedAt, buildFixes: attempt });
         await push(step("error", "Could not get the app serving", log.slice(-400)));
         break;
       }
       attempt++;
       await push(step("fix", `Build issue — self-fixing (attempt ${attempt}/${MAX_FIX})`, log.slice(-200)));
       project.status = "generating";
-      gen = await provider.generate({ prompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), feedback: log, dbAttached, imageDataUrl: opts.imageDataUrl, briefBlock });
+      gen = await provider.generate({ prompt: effectivePrompt, framework: fw, existingAppFiles: appSrcFiles(project, fw), feedback: log, dbAttached, imageDataUrl: opts.imageDataUrl, briefBlock });
       await writeFiles(sid, gen.files);
       project.files = mergeFiles(project.files, gen.files);
     }
@@ -166,7 +254,11 @@ export async function restoreCheckpoint(project: Project, checkpointId: string, 
   try {
     await push(step("plan", `Restoring ${cp.label}…`, cp.message));
     const { sid, fresh } = await ensureSandbox(project, fw, push);
-    if (fresh && fw.install) { await writeFiles(sid, fw.scaffold()); await installDeps(sid, fw, project, push); }
+    if (fresh || project.scaffoldedSandboxId !== sid) {
+      await writeFiles(sid, fw.scaffold());
+      if (fw.install) await installDeps(sid, fw, project, push);
+      project.scaffoldedSandboxId = sid;
+    }
     // Remove any current source the checkpoint doesn't have, then write the snapshot.
     await clearSource(sid, fw, cp.files);
     await writeFiles(sid, cp.files);
@@ -215,6 +307,7 @@ async function ensureTrunkLive(project: Project, fw: FrameworkSpec): Promise<str
   await waitForGuest(sb.id);
   await writeFiles(sb.id, project.files); // project.files holds scaffold + source
   if (fw.install) await installDeps(sb.id, fw, project, noopPush);
+  project.scaffoldedSandboxId = sb.id;
   const dbUrl = project.database?.status === "running" ? project.database.connectionUrl : undefined;
   if (project.database?.status === "running" && fw.id === "next") await ensurePg(sb.id, noopPush);
   await restartDevServer(sb.id, fw, dbUrl);
@@ -302,6 +395,7 @@ export async function runBranchRound(project: Project, basePrompt: string, direc
     project.rounds = [...(project.rounds || []), round];
     project.activeRoundId = roundId;
     emit("round", { round, branches });
+    store.recordMetric(project.id, "round", { branches: branches.length, resolving: !!resolve, auto: false });
 
     // Fan out — one bad branch never blocks the others.
     await Promise.allSettled(branches.map((b) => runOneBranch(project, fw, roundId, baseline, dbAttached, b, provider, patch)));
@@ -426,6 +520,7 @@ export async function keepBranch(project: Project, branchId: string): Promise<Pr
   // teardown stalls, and so a concurrent still-running round can't clobber it.
   const updated = (await store.mutate(project.id, (fp) => {
     fp.sandboxId = winSid;
+    fp.scaffoldedSandboxId = winSid; // the fork inherited the parent's entire disk
     fp.previewUrl = win.previewUrl;
     fp.status = "live";
     fp.files = mergeFiles(mergeFiles(fw.scaffold(), round.baselineFiles), win.files);
@@ -459,6 +554,14 @@ export async function keepBranch(project: Project, branchId: string): Promise<Pr
     }
   }
   await reclaimPendingDbs(project.id).catch(() => {});
+
+  // The strongest taste signal there is: of N live variations they looked at, this
+  // is the one they chose and those are the ones they threw away.
+  const losers = (project.branches || []).filter((b) => b.roundId === round.id && b.id !== branchId);
+  recordSignal("kept-branch", win.readingLabel || win.directive).catch(() => {});
+  for (const l of losers) recordSignal("rejected-branch", l.readingLabel || l.directive).catch(() => {});
+  maybeDistil().catch(() => {});
+  store.recordMetric(project.id, "keep", { what: "branch", label: win.label, resolving: !!round.ambiguityId, of: losers.length + 1 });
   return updated;
 }
 
@@ -477,6 +580,11 @@ export async function keepTrunk(project: Project, roundId?: string): Promise<Pro
   const round = (project.rounds || []).find((r) => r.id === rid);
   const updated = await discardRound(project, rid);
   if (!round?.ambiguityId || !round.trunkReadingLabel) return updated;
+  recordSignal("kept-branch", round.trunkReadingLabel).catch(() => {});
+  for (const b of (project.branches || []).filter((x) => x.roundId === round.id))
+    recordSignal("rejected-branch", b.readingLabel || b.directive).catch(() => {});
+  maybeDistil().catch(() => {});
+  store.recordMetric(project.id, "keep", { what: "trunk", resolving: true });
   return (await store.mutate(project.id, (fp) => {
     recordDecision(fp, round.ambiguityId, round.trunkReadingLabel);
     fp.messages.push({ id: `m${Date.now()}`, role: "assistant", text: `Kept the original — ${round.trunkReadingLabel}. That's the main line.`, ts: Date.now() });
@@ -528,18 +636,30 @@ function applyDecisions(brief: Brief, decisions?: BriefDecision[]) {
 async function verifyTurn(project: Project, push: (s: AgentStep) => Promise<void>, fire: (e: string, d: unknown) => void): Promise<VerifyResult | null> {
   const acceptance = project.brief?.acceptance || [];
   if (!verifyEnabled() || !acceptance.length || !project.previewUrl) return null;
-  await push(step("verify", "Checking it against the brief…", `${acceptance.length} acceptance checks`));
+  const scripted = acceptance.filter((a) => a.check === "interaction" && (a.actions || []).length).length;
+  await push(step("verify", "Checking it against the brief…",
+    `${acceptance.length} acceptance checks${scripted ? ` · ${scripted} by using the app` : ""}`));
   const vr = await verifyApp(project.previewUrl, acceptance);
   if (vr.skipped) { await push(step("verify", "Acceptance check skipped", vr.skipped)); return null; }
 
   project.brief!.verdicts = vr.verdicts;
   project.brief!.updatedAt = Date.now();
+  store.recordMetric(project.id, "verify", {
+    pass: vr.verdicts.filter((v) => v.status === "pass").length,
+    fail: vr.verdicts.filter((v) => v.status === "fail").length,
+    unverifiable: vr.verdicts.filter((v) => v.status === "unverifiable").length,
+    interactions: vr.interactions ?? 0,
+    // The point of the whole pass: the app answered <500 but was still wrong.
+    caughtMiss: vr.verdicts.some((v) => v.status === "fail"),
+  });
   fire("verify", { verdicts: vr.verdicts });
   const pass = vr.verdicts.filter((v) => v.status === "pass").length;
   const fails = vr.verdicts.filter((v) => v.status === "fail");
+  // A failure is emitted as a "fix" step so it reads amber. The accent tone that
+  // "verify" carries is for a pass, and a green-looking failure line is a lie.
   await push(
     fails.length
-      ? step("verify", `${fails.length} of ${vr.verdicts.length} checks failed`, vr.evidenceNote || fails.map((f) => f.reason).join(" · ").slice(0, 200))
+      ? step("fix", `${fails.length} of ${vr.verdicts.length} checks failed`, vr.evidenceNote || fails.map((f) => f.reason).join(" · ").slice(0, 200))
       : step("verify", `Matches the brief — ${pass}/${vr.verdicts.length} checks pass`),
   );
   await save(project);
